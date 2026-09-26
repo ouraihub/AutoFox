@@ -1,0 +1,138 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn-svelte/tailwind.css";
+@custom-variant dark (&:is(.dark *));
+
+@layer base {
+  * { border-color: var(--border); }
+}
+
+:root {
+  --font-display: "Bricolage Grotesque", "Segoe UI", sans-serif;
+  --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --space-2xs: 0.25rem;
+  --space-xs: 0.5rem;
+  --space-sm: 0.75rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2.5rem;
+  --space-2xl: 4rem;
+  --z-modal: 400;
+  --background: oklch(0.985 0.008 92);
+  --foreground: oklch(0.22 0.025 55);
+  --card: oklch(0.995 0.004 90);
+  --card-foreground: oklch(0.22 0.025 55);
+  --popover: oklch(0.995 0.004 90);
+  --popover-foreground: oklch(0.22 0.025 55);
+  --primary: oklch(0.55 0.16 48);
+  --primary-foreground: oklch(0.99 0.01 90);
+  --accent-ink: oklch(0.22 0.025 55);
+  --secondary: oklch(0.93 0.025 85);
+  --secondary-foreground: oklch(0.3 0.04 55);
+  --muted: oklch(0.95 0.012 85);
+  --muted-foreground: oklch(0.5 0.035 55);
+  --accent: oklch(0.91 0.06 72);
+  --accent-foreground: oklch(0.3 0.05 48);
+  --destructive: oklch(0.58 0.2 25);
+  --success: oklch(0.48 0.1 145);
+  --border: oklch(0.88 0.025 75);
+  /* Field rule sits a step darker than `--border`: an input must read as an
+     editable box against `--card`, which `--border` alone is too faint to do.
+     Without this the light theme dropped `border: 1px solid var(--input)` as
+     an invalid declaration and every field rendered borderless. */
+  --input: oklch(0.84 0.03 75);
+  --log-muted: oklch(0.5 0.035 55 / 0.65);
+  --ring: oklch(0.62 0.16 48);
+  --feature-orange-bg: oklch(0.93 0.045 65);
+  --feature-orange-ink: oklch(0.42 0.11 48);
+  --feature-blue-bg: oklch(0.93 0.035 210);
+  --feature-blue-ink: oklch(0.42 0.08 220);
+  --feature-green-bg: oklch(0.93 0.04 145);
+  --feature-green-ink: oklch(0.42 0.08 145);
+}
+
+.dark {
+  --background: oklch(0.18 0.025 55);
+  --foreground: oklch(0.95 0.015 85);
+  --card: oklch(0.22 0.03 55);
+  --card-foreground: oklch(0.95 0.015 85);
+  --popover: oklch(0.22 0.03 55);
+  --popover-foreground: oklch(0.95 0.015 85);
+  --primary: oklch(0.72 0.15 62);
+  --primary-foreground: oklch(0.2 0.03 55);
+  --secondary: oklch(0.29 0.035 55);
+  --secondary-foreground: oklch(0.93 0.015 85);
+  --muted: oklch(0.26 0.03 55);
+  --muted-foreground: oklch(0.73 0.025 75);
+  --accent: oklch(0.34 0.07 62);
+  --accent-foreground: oklch(0.95 0.015 85);
+  --destructive: oklch(0.7 0.17 25);
+  --border: oklch(0.35 0.035 55);
+  --input: oklch(0.35 0.035 55);
+  --ring: oklch(0.72 0.15 62);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 0.2rem);
+  --radius-md: calc(var(--radius) - 0.1rem);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 0.35rem);
+}
+
+html, body { min-height: 100%; overflow-x: clip; }
+body { margin: 0; min-width: 320px; background: var(--background); color: var(--foreground); font-family: var(--font-body); }
+h1, h2, h3 { font-family: var(--font-display); }
+button { cursor: pointer; }
+
+.ui-button { display: inline-flex; min-height: 2.75rem; align-items: center; justify-content: center; gap: .4rem; border: 1px solid transparent; border-radius: .6rem; padding: .68rem .9rem; color: var(--foreground); font: inherit; font-size: .78rem; font-weight: 650; outline: 2px solid transparent; outline-offset: 2px; white-space: nowrap; transition: background-color 120ms ease, color 120ms ease, transform 80ms ease; }
+.ui-button:focus-visible { outline-color: var(--ring); }.ui-button:active { transform: translateY(1px); }.ui-button:disabled { cursor: not-allowed; opacity: .5; }.ui-button-default { background: var(--primary); color: var(--primary-foreground); }.ui-button-outline { border-color: var(--border); background: var(--background); }.ui-button-secondary { background: var(--secondary); color: var(--secondary-foreground); }.ui-button-ghost { background: transparent; }.ui-button-destructive { background: color-mix(in oklab, var(--destructive) 12%, transparent); color: var(--destructive); }
+/* Hover lives behind `hover: hover` so a touch tap does not leave a control
+   stuck in its hover paint after the finger lifts. */
+@media (hover: hover) {
+  .ui-button-default:not(:disabled):hover { background: color-mix(in oklab, var(--primary) 88%, var(--foreground)); }
+  .ui-button-outline:not(:disabled):hover, .ui-button-secondary:not(:disabled):hover { background: var(--secondary); }
+  .ui-button-ghost:not(:disabled):hover { background: var(--muted); }
+  .ui-input:not(:disabled):hover { background: var(--muted); }
+}
+.ui-input { min-height: 2.75rem; width: 100%; min-width: 0; border: 1px solid var(--input); border-radius: .6rem; background: var(--background); color: var(--foreground); padding: .45rem .65rem; outline: 2px solid transparent; outline-offset: 1px; }.ui-input:focus-visible { outline-color: var(--ring); }.ui-input[aria-invalid='true'] { border-color: var(--destructive); }.ui-input:disabled { cursor: not-allowed; opacity: .5; }
+.ui-badge { display: inline-flex; align-items: center; min-height: 1.5rem; border: 1px solid transparent; border-radius: 999px; padding: .2rem .55rem; font-size: .68rem; font-weight: 650; white-space: nowrap; }.ui-badge-default { background: var(--primary); color: var(--primary-foreground); }.ui-badge-secondary { background: var(--secondary); color: var(--secondary-foreground); }.ui-badge-outline { border-color: var(--border); }.ui-badge-destructive { background: color-mix(in oklab, var(--destructive) 12%, transparent); color: var(--destructive); }
+.ui-progress { width: 100%; height: .45rem; overflow: hidden; border-radius: 999px; background: var(--muted); }.ui-progress span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width 150ms ease; }.ui-separator { background: var(--border); }.ui-separator-horizontal { width: 100%; height: 1px; }.ui-separator-vertical { width: 1px; height: 100%; }.ui-empty { display: grid; justify-items: center; gap: .4rem; padding: var(--space-lg); color: var(--muted-foreground); text-align: center; }.ui-empty-mark { display: grid; place-items: center; width: 2.5rem; height: 2.5rem; border-radius: .7rem; background: var(--muted); color: var(--primary); font-family: var(--font-mono); }.ui-empty strong { color: var(--foreground); font-family: var(--font-display); }.ui-empty p { max-width: 38ch; margin: 0; font-size: .78rem; line-height: 1.55; }
+/* Tabs. The trigger keeps a constant 1px bottom rule in every state and moves
+   only its colour, so selecting a tab never shifts the panel below it. */
+.ui-tabs { display: flex; flex-direction: column; min-height: 0; }
+.ui-tabs-list { display: flex; gap: var(--space-2xs); border-bottom: 1px solid var(--border); }
+.ui-tabs-trigger { position: relative; min-height: 2.5rem; padding: .5rem .8rem; margin-bottom: -1px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted-foreground); font: inherit; font-size: .78rem; font-weight: 650; outline: 2px solid transparent; outline-offset: -2px; }
+/* Touch floor: the visual row is 2.5rem, so an invisible overlay lifts the hit
+   target to 44px without changing the rule's position. */
+.ui-tabs-trigger::before { content: ""; position: absolute; inset: -1px 0; }
+.ui-tabs-trigger:focus-visible { outline-color: var(--ring); }
+.ui-tabs-trigger[aria-selected="true"] { border-bottom-color: var(--primary); color: var(--foreground); }
+.ui-tabs-trigger:disabled { cursor: not-allowed; opacity: .5; }
+@media (hover: hover) {
+  .ui-tabs-trigger:not(:disabled):not([aria-selected="true"]):hover { color: var(--foreground); }
+}
+.ui-tabs-panel { flex: 1; min-height: 0; padding-top: var(--space-md); outline: 2px solid transparent; outline-offset: 2px; }
+.ui-tabs-panel:focus-visible { outline-color: var(--ring); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 1ms !important; animation-duration: 1ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+}

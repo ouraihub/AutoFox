@@ -1,0 +1,10 @@
+packages:
+  - "."
+
+cargo:
+  enabled: true
+
+engineStrict: true
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - vite

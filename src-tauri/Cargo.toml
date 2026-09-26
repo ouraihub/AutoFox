@@ -1,0 +1,42 @@
+[package]
+name = "autofox"
+version = "0.1.0"
+description = "AutoFox desktop media downloader"
+authors = ["AutoFox"]
+edition.workspace = true
+
+[lib]
+name = "autofox_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "autofox"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.6", features = [] }
+tauri-plugin-dialog = "=2.7.3"
+tauri-plugin-opener = "=2.5.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "io-util", "sync", "process", "fs"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "charset", "gzip", "brotli", "deflate", "stream"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = "0.3.34"
+uuid = { version = "1.26.1", features = ["v4"] }
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+node_modules/
+.pnpm-store/
+.svelte-kit/
+build/
+dist/
+target/
+src-tauri/target/
+.env
+.env.*
+!.env.example
+.omp/
+# Local-only agent settings; the tracked skills under .claude/skills stay.
+.claude/settings.local.json
+# Throwaway smoke scripts written during verification.
+.smoke-*.mjs
+.smoke/
+# The root logo is the original source copy; the build consumes
+# static/autofox.png and src-tauri/icons/icon.png instead.
+/autofox.png
+.pnpm/
+.cargo/config.toml
+src-tauri/gen/
+*.log
+
+# Release-only binaries are supplied during packaging.
+yt-dlp.exe
+lib/ffmpeg.exe
+lib/ffprobe.exe

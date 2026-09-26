@@ -1,0 +1,15 @@
+# Without this, line endings depend on each developer's `core.autocrlf`, which
+# churns the lockfiles and can break `.bat` scripts fed to cmd.exe as LF.
+* text=auto eol=lf
+
+# cmd.exe is the only consumer of these and wants CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Generated: keep diffs collapsed and out of language stats.
+pnpm-lock.yaml -diff linguist-generated
+Cargo.lock -diff linguist-generated
+
+*.png binary
+*.ico binary
