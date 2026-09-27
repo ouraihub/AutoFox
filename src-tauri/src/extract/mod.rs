@@ -1,5 +1,8 @@
 //! Parser backend discovery and yt-dlp JSON probing.
 
+pub mod backend;
+pub mod options;
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -15,6 +18,7 @@ use url::Url;
 use crate::{
     ipc::{ErrorCode, IpcError},
     logs,
+    settings::ExtractorPolicy,
     system::paths,
 };
 
@@ -58,8 +62,10 @@ pub struct MediaManifest {
     pub title: String,
     /// Duration in seconds, when supplied by the backend.
     pub duration_secs: Option<f64>,
-    /// Available media formats.
+    /// Available media formats, exactly as the backend reported them.
     pub formats: Vec<MediaFormat>,
+    /// The collapsed quality list the UI offers; derived from `formats`.
+    pub download_options: Vec<options::DownloadOption>,
     /// Playlist entries, when playlist probing is enabled.
     pub entries: Vec<PlaylistEntry>,
     /// Backend that produced this manifest.
@@ -104,7 +110,13 @@ pub struct MediaFormat {
 
 /// Format delivery mechanism.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+// See `options::DeliveryPlan`: `rename_all` alone leaves `playlist_url` and
+// `manifest_url` in snake_case, which the TypeScript type reads as `undefined`.
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub enum Delivery {
     /// A single HTTP resource.
     Direct { url: String },
@@ -209,7 +221,11 @@ pub async fn get_backend_status(
     .await
 }
 
-/// Parses a URL with the bundled yt-dlp executable.
+/// Resolves the backend chain for the configured policy and probes one URL.
+///
+/// Only one backend is registered today, so this reads as a thin wrapper. It
+/// is not: it is the seam that makes `extractorPolicy` load-bearing, and until
+/// it existed the settings dropdown silently did nothing.
 #[tauri::command]
 pub async fn probe_url(
     state: tauri::State<'_, crate::settings::SettingsState>,
@@ -230,6 +246,33 @@ pub async fn probe_url(
         TARGET,
         format!("probing {}", logs::redact_url(url.as_str())),
     );
+
+    // The native extractor is not implemented yet, so `nativeOnly` has no
+    // candidate. Saying so beats quietly probing with yt-dlp, which is exactly
+    // what happened while nothing read this setting.
+    if settings.extractor_policy == ExtractorPolicy::NativeOnly {
+        logs::error(TARGET, "policy pins the native backend, which is absent");
+        return Err(IpcError {
+            code: ErrorCode::NoBackendAvailable,
+            message_key: "errors.nativeBackendAbsent",
+            field: None,
+            retryable: false,
+            detail: "the native extractor is not implemented in this build".to_owned(),
+        });
+    }
+
+    logs::debug(
+        TARGET,
+        format!("candidate backend {}", backend::PROCESS_YTDLP),
+    );
+    probe_via_ytdlp(&settings, &url).await
+}
+
+/// Probes one URL with the bundled or configured yt-dlp executable.
+async fn probe_via_ytdlp(
+    settings: &crate::settings::Settings,
+    url: &Url,
+) -> Result<MediaManifest, IpcError> {
     let bundled = paths::bundled_ytdlp().map_err(|error| IpcError::internal(error.to_string()))?;
     let executable = paths::configured_or_bundled(settings.ytdlp_path.as_deref(), bundled);
     if !is_executable_file(&executable) {
@@ -405,10 +448,12 @@ fn manifest_from_json(payload: &Value, backend_version: String) -> Result<MediaM
                 .collect()
         })
         .unwrap_or_default();
+    let download_options = options::build(&formats);
     Ok(MediaManifest {
         source_id,
         title,
         duration_secs: number_field(payload, "duration"),
+        download_options,
         formats,
         entries,
         produced_by: "ytdlp".to_owned(),
@@ -490,7 +535,7 @@ fn display_path(path: PathBuf) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Delivery, SizeHint, manifest_from_json};
+    use super::{Delivery, SizeHint, manifest_from_json, options};
     use serde_json::json;
 
     #[test]
@@ -519,5 +564,129 @@ mod tests {
             Delivery::Direct { .. }
         ));
         assert!(matches!(manifest.formats[0].size, SizeHint::Exact(1024)));
+    }
+
+    /// `downloadStream` reads `delivery.playlistUrl`; a snake_case key makes it
+    /// send `undefined` to ffmpeg with no compile-time warning.
+    #[test]
+    fn delivery_variants_serialize_camel_case_urls() {
+        let hls = serde_json::to_value(Delivery::Hls {
+            playlist_url: "https://cdn.example/p.m3u8".to_owned(),
+        })
+        .expect("serialize");
+        assert_eq!(hls["kind"], "hls");
+        assert!(hls.get("playlistUrl").is_some(), "expected playlistUrl");
+        let dash = serde_json::to_value(Delivery::Dash {
+            manifest_url: "https://cdn.example/m.mpd".to_owned(),
+        })
+        .expect("serialize");
+        assert!(dash.get("manifestUrl").is_some(), "expected manifestUrl");
+    }
+
+    /// Mirrors the row mix a real YouTube watch URL returns: storyboards, an
+    /// HLS twin of each DASH rendition, and split video/audio streams.
+    fn youtube_shaped_payload() -> serde_json::Value {
+        json!({
+            "id": "wENWYQpe4pQ",
+            "title": "Example",
+            "formats": [
+                { "format_id": "sb0", "url": "https://cdn.example/sb.mhtml", "protocol": "https",
+                  "ext": "mhtml", "vcodec": "none", "acodec": "none", "width": 80, "height": 45 },
+                { "format_id": "233", "url": "https://cdn.example/a.m3u8", "protocol": "m3u8_native",
+                  "ext": "mp4", "vcodec": "none", "acodec": "aac" },
+                { "format_id": "140", "url": "https://cdn.example/a.m4a", "protocol": "https",
+                  "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129.0,
+                  "filesize": 3_300_000 },
+                { "format_id": "251", "url": "https://cdn.example/a.webm", "protocol": "https",
+                  "ext": "webm", "vcodec": "none", "acodec": "opus", "abr": 141.0,
+                  "filesize": 3_400_000 },
+                { "format_id": "312", "url": "https://cdn.example/v1080.m3u8", "protocol": "m3u8_native",
+                  "ext": "mp4", "vcodec": "avc1.64002A", "acodec": "none", "width": 1920, "height": 1080 },
+                { "format_id": "299", "url": "https://cdn.example/v1080.mp4", "protocol": "https",
+                  "ext": "mp4", "vcodec": "avc1.64002a", "acodec": "none", "width": 1920,
+                  "height": 1080, "fps": 60.0, "filesize": 22_700_000 },
+                { "format_id": "303", "url": "https://cdn.example/v1080.webm", "protocol": "https",
+                  "ext": "webm", "vcodec": "vp9", "acodec": "none", "width": 1920, "height": 1080,
+                  "fps": 60.0, "filesize": 10_500_000 },
+                { "format_id": "18", "url": "https://cdn.example/360.mp4", "protocol": "https",
+                  "ext": "mp4", "vcodec": "avc1.42001E", "acodec": "mp4a.40.2", "width": 640,
+                  "height": 360, "filesize": 5_000_000 }
+            ]
+        })
+    }
+
+    #[test]
+    fn collapses_youtube_rows_into_one_option_per_height_plus_audio() {
+        let manifest =
+            manifest_from_json(&youtube_shaped_payload(), "test".to_owned()).expect("maps");
+        let labels: Vec<&str> = manifest
+            .download_options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
+        // 8 raw rows -> 1080p, 360p, audio. Storyboards and the HLS twins are
+        // gone, and 45p never becomes an option.
+        assert_eq!(labels, vec!["1080p60", "360p", "仅音频"]);
+    }
+
+    #[test]
+    fn pairs_video_only_stream_with_best_audio_and_sums_size() {
+        let manifest =
+            manifest_from_json(&youtube_shaped_payload(), "test".to_owned()).expect("maps");
+        let top = &manifest.download_options[0];
+        assert_eq!(top.container, "mp4");
+        // 299 (h264 direct) beats 303 (vp9) and 312 (HLS); 140 (AAC) beats 251
+        // (Opus) for MP4 compatibility.
+        match &top.plan {
+            options::DeliveryPlan::Merge {
+                video_format_id,
+                audio_format_id,
+                ..
+            } => {
+                assert_eq!(video_format_id, "299");
+                assert_eq!(audio_format_id, "140");
+            }
+            other => panic!("expected a merge plan, got {other:?}"),
+        }
+        assert!(matches!(top.size, SizeHint::Exact(26_000_000)));
+    }
+
+    #[test]
+    fn prefers_progressive_row_so_no_ffmpeg_pass_is_needed() {
+        let manifest =
+            manifest_from_json(&youtube_shaped_payload(), "test".to_owned()).expect("maps");
+        let p360 = manifest
+            .download_options
+            .iter()
+            .find(|o| o.label == "360p")
+            .expect("360p present");
+        match &p360.plan {
+            options::DeliveryPlan::Progressive { format_id, .. } => assert_eq!(format_id, "18"),
+            other => panic!("expected progressive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offers_manifest_plan_when_no_audio_track_exists() {
+        let payload = json!({
+            "id": "x", "title": "No audio",
+            "formats": [{ "format_id": "137", "url": "https://cdn.example/v.m3u8",
+                "protocol": "m3u8_native", "ext": "mp4", "vcodec": "avc1.640028",
+                "acodec": "none", "width": 1920, "height": 1080 }]
+        });
+        let manifest = manifest_from_json(&payload, "test".to_owned()).expect("maps");
+        assert_eq!(manifest.download_options.len(), 1);
+        assert!(matches!(
+            manifest.download_options[0].plan,
+            options::DeliveryPlan::Manifest { .. }
+        ));
+    }
+
+    #[test]
+    fn keeps_raw_formats_available_alongside_the_collapsed_list() {
+        let manifest =
+            manifest_from_json(&youtube_shaped_payload(), "test".to_owned()).expect("maps");
+        // The advanced view still needs every row, storyboards included.
+        assert_eq!(manifest.formats.len(), 8);
     }
 }

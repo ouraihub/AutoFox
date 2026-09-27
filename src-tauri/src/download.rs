@@ -68,6 +68,13 @@ pub struct DownloadProgress {
     pub total_bytes: Option<u64>,
     /// Current bytes per second.
     pub bytes_per_second: u64,
+    /// Completion fraction in `0.0..=1.0` when it can be known.
+    ///
+    /// The muxer cannot report bytes against a known total, so it fills this
+    /// from elapsed media time instead. Downloads set it only when the server
+    /// sent a length. The UI prefers it over the byte ratio so both task kinds
+    /// render one bar.
+    pub percent: Option<f64>,
 }
 
 /// Downloads a direct HTTP format to an atomic final file.
@@ -231,6 +238,9 @@ async fn download_direct_task(
             bytes_written,
             total_bytes,
             bytes_per_second: (bytes_written as f64 / elapsed) as u64,
+            percent: total_bytes
+                .filter(|total| *total > 0)
+                .map(|total| (bytes_written as f64 / total as f64).clamp(0.0, 1.0)),
         };
         if let Some(app) = app {
             let _ = tauri::Emitter::emit(app, "task://progress", event);

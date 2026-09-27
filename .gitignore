@@ -24,5 +24,7 @@ src-tauri/gen/
 
 # Release-only binaries are supplied during packaging.
 yt-dlp.exe
+# yt-dlp needs a JS runtime for YouTube; see `yt-dlp.README.md`.
+deno.exe
 lib/ffmpeg.exe
 lib/ffprobe.exe

@@ -1,5 +1,9 @@
 //! ffmpeg stream copy orchestration for separate audio/video formats.
 
+#[cfg(test)]
+#[path = "mux_tests.rs"]
+mod mux_tests;
+
 use std::{path::PathBuf, process::Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -30,9 +34,19 @@ pub struct MuxRequest {
     pub output_directory: String,
     /// Output file name without extension.
     pub file_name: String,
+    /// Target container, e.g. `mp4` or `webm`.
+    ///
+    /// Sent by the caller because the option list already decided it: a VP9 or
+    /// AV1 pair is offered as WebM, and forcing those into MP4 produces a file
+    /// whose extension lies about its playability.
+    pub container: String,
     /// Headers passed to both input streams.
     #[serde(default)]
     pub http_headers: std::collections::BTreeMap<String, String>,
+    /// Media duration from the manifest, used to turn ffmpeg's elapsed media
+    /// time into a completion fraction. Absent means an indeterminate bar.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 /// Result of a successful ffmpeg mux operation.
@@ -92,6 +106,10 @@ pub struct StreamRequest {
     pub output_directory: String,
     /// Output file name without extension.
     pub file_name: String,
+    /// Media duration from the manifest, used to turn ffmpeg's elapsed media
+    /// time into a completion fraction. Absent means an indeterminate bar.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 async fn download_stream_inner(
@@ -99,6 +117,7 @@ async fn download_stream_inner(
     request: StreamRequest,
 ) -> Result<MuxResult, IpcError> {
     let input = validate_http_url(&request.url, "url")?;
+    let duration_secs = request.duration_secs;
     let ffmpeg = paths::bundled_ffmpeg().map_err(|error| internal(error.to_string()))?;
     if !ffmpeg.is_file() {
         return Err(IpcError {
@@ -126,8 +145,17 @@ async fn download_stream_inner(
         "copy",
         "-movflags",
         "+faststart",
+        // See `mux_streams_inner`: ffmpeg cannot infer a container from the
+        // `.part` suffix, so the format is named explicitly.
+        "-f",
+        "mp4",
         "-progress",
         "pipe:1",
+        // ffmpeg's default progress cadence follows encoder output, which for a
+        // stream copy can mean a single report for the whole job. Pin it to a
+        // wall-clock interval so the bar actually moves.
+        "-stats_period",
+        "0.5",
         "-nostats",
         temp_path.to_string_lossy().as_ref(),
     ]);
@@ -135,11 +163,12 @@ async fn download_stream_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = timeout(MUX_TIMEOUT, command.output())
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|error| internal(error.to_string()))?;
-    emit_ffmpeg_progress(app, &output.stdout);
+    let output = run_with_progress(command, "mux", duration_secs, |event| {
+        if let Some(app) = app {
+            let _ = tauri::Emitter::emit(app, "task://progress", event);
+        }
+    })
+    .await?;
     if !output.status.success() {
         return Err(IpcError {
             code: ErrorCode::MuxFailed,
@@ -157,24 +186,100 @@ async fn download_stream_inner(
     })
 }
 
-fn emit_ffmpeg_progress(app: Option<&tauri::AppHandle>, stdout: &[u8]) {
-    let mut out_time_ms = None;
-    let mut speed = None;
-    for line in String::from_utf8_lossy(stdout).lines() {
-        if let Some(value) = line.strip_prefix("out_time_ms=") {
-            out_time_ms = value.parse::<u64>().ok();
+/// Runs ffmpeg to completion, emitting `task://progress` as its output grows.
+///
+/// ffmpeg's `-progress pipe:1` stream is the only progress signal available for
+/// a mux: the HTTP reads happen inside the child. Waiting for the process with
+/// `Command::output` would buffer that stream and deliver every line after the
+/// file is already written, which is no progress at all, so stdout is consumed
+/// line by line while the child runs.
+///
+/// `duration_secs` converts `out_time_ms` into a fraction. Without it only the
+/// written byte count is reported, and the bar stays indeterminate.
+///
+/// Progress goes to `sink` rather than straight to the app handle so the
+/// streaming behaviour is observable without a Tauri runtime.
+async fn run_with_progress(
+    mut command: Command,
+    task_id: &str,
+    duration_secs: Option<f64>,
+    mut sink: impl FnMut(crate::download::DownloadProgress),
+) -> Result<std::process::Output, IpcError> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| internal(error.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| internal("ffmpeg stdout was not piped".to_owned()))?;
+    // stderr must drain concurrently: ffmpeg blocks once its pipe buffer fills,
+    // which would deadlock against this stdout loop.
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| internal("ffmpeg stderr was not piped".to_owned()))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let mut reader = stderr;
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer).await;
+        buffer
+    });
+
+    let started = std::time::Instant::now();
+    let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(stdout));
+    let mut total_size = 0_u64;
+    let mut elapsed_media: Option<f64> = None;
+    let pump = async {
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|error| internal(error.to_string()))?
+        {
+            if let Some(value) = line.strip_prefix("total_size=") {
+                total_size = value.trim().parse().unwrap_or(total_size);
+            }
+            if let Some(value) = line.strip_prefix("out_time_ms=") {
+                // ffmpeg writes `N/A` until the first frame lands, and the key
+                // is named `_ms` but carries microseconds.
+                elapsed_media = value.trim().parse::<u64>().ok().map(|us| us as f64 / 1e6);
+            }
+            // `progress=` terminates each block. Keying on it rather than on a
+            // parsed time keeps the early `N/A` blocks: they still carry bytes
+            // written, and dropping them left the bar frozen for the first
+            // second of every mux.
+            if !line.starts_with("progress=") {
+                continue;
+            }
+            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+            let event = crate::download::DownloadProgress {
+                task_id: task_id.to_owned(),
+                bytes_written: total_size,
+                total_bytes: None,
+                bytes_per_second: (total_size as f64 / elapsed) as u64,
+                // No percent until both the duration and a real `out_time_ms`
+                // exist; the byte counter carries the UI until then.
+                percent: elapsed_media
+                    .zip(duration_secs.filter(|total| *total > 0.0))
+                    .map(|(media, total)| (media / total).clamp(0.0, 1.0)),
+            };
+            sink(event);
         }
-        if let Some(value) = line.strip_prefix("speed=") {
-            speed = Some(value.to_owned());
-        }
-    }
-    if let Some(app) = app {
-        let _ = tauri::Emitter::emit(
-            app,
-            "task://progress",
-            serde_json::json!({ "stage": "muxing", "outTimeMs": out_time_ms, "speed": speed }),
-        );
-    }
+        Ok::<(), IpcError>(())
+    };
+
+    timeout(MUX_TIMEOUT, pump)
+        .await
+        .map_err(|_| timed_out())??;
+    let status = timeout(MUX_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| timed_out())?
+        .map_err(|error| internal(error.to_string()))?;
+    let stderr = stderr_task.await.unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
 }
 
 /// Runs ffmpeg with separate video and audio inputs and `-c copy`.
@@ -191,15 +296,18 @@ pub async fn mux_streams(
             logs::redact_url(&request.audio_url)
         ),
     );
-    mux_streams_inner(Some(&app), request)
-        .await
-        .inspect(|_| logs::info(TARGET, "mux finished"))
-        .inspect_err(|error| logs::error(TARGET, format!("mux failed: {}", error.detail)))
+    mux_streams_inner(Some(&app), request, |event| {
+        let _ = tauri::Emitter::emit(&app, "task://progress", event);
+    })
+    .await
+    .inspect(|_| logs::info(TARGET, "mux finished"))
+    .inspect_err(|error| logs::error(TARGET, format!("mux failed: {}", error.detail)))
 }
 
 async fn mux_streams_inner(
     app: Option<&tauri::AppHandle>,
     request: MuxRequest,
+    sink: impl FnMut(crate::download::DownloadProgress),
 ) -> Result<MuxResult, IpcError> {
     let video = validate_http_url(&request.video_url, "videoUrl")?;
     let audio = validate_http_url(&request.audio_url, "audioUrl")?;
@@ -218,26 +326,54 @@ async fn mux_streams_inner(
         .await
         .map_err(|error| io_error(error.to_string()))?;
     let name = sanitize_file_name(&request.file_name);
-    let final_path = output_dir.join(format!("{name}.mp4"));
-    let temp_path = output_dir.join(format!("{name}.mp4.part"));
+    // An unknown container would reach ffmpeg as `-f <junk>`; reject it here so
+    // the error names the real problem instead of surfacing ffmpeg's usage text.
+    let container = match request.container.as_str() {
+        "mp4" => "mp4",
+        "webm" => "webm",
+        other => {
+            return Err(IpcError {
+                code: ErrorCode::Validation,
+                message_key: "errors.unsupportedContainer",
+                field: Some("container"),
+                retryable: false,
+                detail: format!("unsupported output container: {other}"),
+            });
+        }
+    };
+    let final_path = output_dir.join(format!("{name}.{container}"));
+    let temp_path = output_dir.join(format!("{name}.{container}.part"));
+    // googlevideo rejects the CDN URLs with 403 unless the request repeats the
+    // User-Agent the extractor used, so `-headers` must precede each `-i`: in
+    // ffmpeg it is a per-input option, not a global one.
+    let header_block = header_block(&request.http_headers);
     let mut command = Command::new(ffmpeg);
+    command.args(["-hide_banner", "-y"]);
+    for input in [video.as_str(), audio.as_str()] {
+        if let Some(headers) = header_block.as_deref() {
+            command.args(["-headers", headers]);
+        }
+        command.args(["-i", input]);
+    }
+    command.args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"]);
+    // `+faststart` moves the MP4 moov atom to the front for progressive
+    // playback. It is an MP4 muxer option; ffmpeg errors out on WebM.
+    if container == "mp4" {
+        command.args(["-movflags", "+faststart"]);
+    }
     command.args([
-        "-hide_banner",
-        "-y",
-        "-i",
-        video.as_str(),
-        "-i",
-        audio.as_str(),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
+        // The output is written to `.<ext>.part` so a crash cannot leave a
+        // half-written media file behind, but ffmpeg picks the container from
+        // the extension and does not know `.part`. Without this it fails for
+        // every input with "Unable to choose an output format".
+        "-f",
+        container,
         "-progress",
         "pipe:1",
+        // See `download_stream_inner`: the default cadence can report once for
+        // an entire stream copy.
+        "-stats_period",
+        "0.5",
         "-nostats",
         temp_path.to_string_lossy().as_ref(),
     ]);
@@ -245,11 +381,21 @@ async fn mux_streams_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = timeout(MUX_TIMEOUT, command.output())
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|error| internal(error.to_string()))?;
+    let output = run_with_progress(command, "mux", request.duration_secs, sink).await?;
     if !output.status.success() {
+        // ffmpeg's own diagnosis is the only way to tell a dead CDN URL from a
+        // codec the container rejects, and it never contains the signed query.
+        logs::error(
+            TARGET,
+            format!(
+                "ffmpeg mux failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .filter(|line| line.contains("Error") || line.contains("Invalid"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        );
         return Err(IpcError {
             code: ErrorCode::MuxFailed,
             message_key: "errors.muxFailed",
@@ -271,6 +417,25 @@ async fn mux_streams_inner(
     Ok(MuxResult {
         output_path: final_path.to_string_lossy().into_owned(),
     })
+}
+
+/// Renders headers as the CRLF-delimited block ffmpeg's `-headers` expects.
+///
+/// A header value carrying its own CRLF would let a caller append arbitrary
+/// extra headers to the CDN request, so such entries are dropped rather than
+/// escaped: no legitimate value in a yt-dlp manifest contains one.
+fn header_block(headers: &std::collections::BTreeMap<String, String>) -> Option<String> {
+    let mut block = String::new();
+    for (name, value) in headers {
+        if name.is_empty() || name.contains([':', '\r', '\n']) || value.contains(['\r', '\n']) {
+            continue;
+        }
+        block.push_str(name);
+        block.push_str(": ");
+        block.push_str(value);
+        block.push_str("\r\n");
+    }
+    (!block.is_empty()).then_some(block)
 }
 
 fn validate_http_url(value: &str, field: &'static str) -> Result<url::Url, IpcError> {
