@@ -20,11 +20,25 @@ export type MediaFormat = {
   size: SizeHint;
   httpHeaders: Record<string, string>;
 };
+export type DeliveryPlan =
+  | { kind: 'progressive'; formatId: string; url: string }
+  | { kind: 'merge'; videoUrl: string; audioUrl: string; videoFormatId: string; audioFormatId: string }
+  | { kind: 'manifest'; formatId: string; url: string };
+export type DownloadOption = {
+  optionId: string;
+  label: string;
+  container: string;
+  detail: string;
+  size: SizeHint;
+  height?: number;
+  plan: DeliveryPlan;
+};
 export type MediaManifest = {
   sourceId: string;
   title: string;
   durationSecs?: number;
   formats: MediaFormat[];
+  downloadOptions: DownloadOption[];
   producedBy: string;
   backendVersion: string;
 };
@@ -53,13 +67,13 @@ export async function downloadDirect(request: DownloadRequest): Promise<Download
   }
   return invoke<DownloadResult>('download_direct', { request });
 }
-export type StreamRequest = { url: string; outputDirectory: string; fileName: string };
+export type StreamRequest = { url: string; outputDirectory: string; fileName: string; durationSecs?: number };
 export async function downloadStream(request: StreamRequest): Promise<MuxResult> {
   if (!isDesktop) throw new Error('AutoFox IPC is available only in the Tauri desktop runtime');
   return invoke<MuxResult>('download_stream', { request });
 }
 
-export type MuxRequest = { videoUrl: string; audioUrl: string; outputDirectory: string; fileName: string; httpHeaders: Record<string, string> };
+export type MuxRequest = { videoUrl: string; audioUrl: string; outputDirectory: string; fileName: string; container: string; httpHeaders: Record<string, string>; durationSecs?: number };
 export type MuxResult = { outputPath: string };
 export async function muxStreams(request: MuxRequest): Promise<MuxResult> {
   if (!isDesktop) throw new Error('AutoFox IPC is available only in the Tauri desktop runtime');
@@ -82,6 +96,10 @@ export async function saveSettings(settings: Settings): Promise<void> {
 }
 
 export type TaskState = 'downloading' | 'paused' | 'done' | 'failed' | 'cancelled';
+// Payload of `task://progress`, emitted by both the direct download loop and
+// the ffmpeg muxer. `percent` is the only field both can fill meaningfully:
+// the muxer knows elapsed media time, not the final byte total.
+export type TaskProgress = { taskId: string; bytesWritten: number; totalBytes?: number; bytesPerSecond: number; percent?: number };
 export type TaskSummary = { taskId: string; kind: string; state: TaskState; outputPath?: string; errorKey?: string };
 
 export async function listTasks(): Promise<TaskSummary[]> {
@@ -122,6 +140,19 @@ export type IpcError = {
   retryable: boolean;
   detail: string;
 };
+
+/** Tauri rejects with the serialized `IpcError`, which is a plain object and
+ * fails `instanceof Error`. Without this every backend diagnosis collapsed to
+ * a generic fallback string and `detail` never reached the user. */
+export function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'object' && error !== null && 'detail' in error) {
+    const { detail } = error as IpcError;
+    if (typeof detail === 'string' && detail.length > 0) return detail;
+  }
+  if (typeof error === 'string' && error.length > 0) return error;
+  return fallback;
+}
 
 export const isDesktop = isTauri();
 

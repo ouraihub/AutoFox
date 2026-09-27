@@ -1,7 +1,14 @@
 //! Application settings boundary.
 
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod settings_tests;
+
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use crate::ipc::IpcError;
 use tauri::Manager;
@@ -14,8 +21,38 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, IpcError> {
     Ok(dir.join("settings.json"))
 }
 
+/// Rejects a download directory the app could never write into.
+///
+/// Only two things are checked here, and both are cheap and stable: the path
+/// must be absolute, and if it already exists it must be a directory. Write
+/// permission is deliberately *not* probed -- it can change between saving
+/// settings and starting a download, so `download.rs` has to handle the
+/// failure anyway, and a probe here would only add a false sense of safety.
+/// A non-existent absolute path is accepted: `download.rs` calls
+/// `create_dir_all` before writing.
+fn validate_download_directory(directory: &str) -> Result<(), IpcError> {
+    let invalid = |detail: &str| IpcError {
+        code: crate::ipc::ErrorCode::Validation,
+        message_key: "errors.invalidDownloadDirectory",
+        field: Some("downloadDirectory"),
+        retryable: false,
+        detail: detail.to_owned(),
+    };
+    if directory.trim().is_empty() {
+        return Err(invalid("download directory must not be blank"));
+    }
+    let path = Path::new(directory);
+    if !path.is_absolute() {
+        return Err(invalid("download directory must be an absolute path"));
+    }
+    if path.exists() && !path.is_dir() {
+        return Err(invalid("download directory is not a directory"));
+    }
+    Ok(())
+}
+
 /// Parser selection policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ExtractorPolicy {
     /// Choose according to configured backend order.
@@ -100,6 +137,9 @@ pub fn save_settings(
             detail: "unsupported settings schema".to_owned(),
         });
     }
+    if let Some(directory) = settings.download_directory.as_deref() {
+        validate_download_directory(directory)?;
+    }
     let path = settings_path(&app)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| IpcError::internal(error.to_string()))?;
@@ -110,8 +150,13 @@ pub fn save_settings(
     crate::logs::info(
         "settings",
         format!(
-            "saved: policy={:?} logLevel={} pathLookup={}",
-            settings.extractor_policy, settings.log_level, settings.allow_path_lookup
+            // The directory itself stays out of the log: it is user data and
+            // the only fact worth recording is whether the default is in use.
+            "saved: policy={:?} logLevel={} pathLookup={} customDownloadDir={}",
+            settings.extractor_policy,
+            settings.log_level,
+            settings.allow_path_lookup,
+            settings.download_directory.is_some()
         ),
     );
     state

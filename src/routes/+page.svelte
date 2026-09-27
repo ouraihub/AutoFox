@@ -3,17 +3,24 @@
   import { Download, FolderOpen, Activity } from '@lucide/svelte';
   import { Button, Input, Badge, Progress, Empty, Tabs, LogBar, type TabItem } from '$lib/components/ui';
   import { downloadDir } from '@tauri-apps/api/path';
+  import { open } from '@tauri-apps/plugin-dialog';
   import { listen } from '@tauri-apps/api/event';
-  import { cancelTask, downloadDirect, downloadStream, getBackendStatus, getSettings, isDesktop, listTasks, probeUrl, saveSettings, type BackendStatus, type MediaFormat, type MediaManifest, type Settings, type TaskSummary } from '$lib/ipc/client';
+  import { cancelTask, downloadDirect, downloadStream, errorMessage, getBackendStatus, getSettings, isDesktop, listTasks, muxStreams, probeUrl, saveSettings, type BackendStatus, type DownloadOption, type MediaManifest, type Settings, type SizeHint, type TaskProgress, type TaskSummary } from '$lib/ipc/client';
 
   let url = $state('');
   let backend = $state<BackendStatus | null>(null);
   let manifest = $state<MediaManifest | null>(null);
   let probing = $state(false);
   let downloading = $state(false);
-  let selectedFormat = $state<MediaFormat | null>(null);
-  let progress = $state<{ bytesWritten: number; totalBytes?: number; bytesPerSecond: number } | null>(null);
+  let selectedOption = $state<DownloadOption | null>(null);
+  let progress = $state<TaskProgress | null>(null);
   let notice = $state('');
+  // The muxer reports `percent` without a byte total and the download path
+  // reports both, so a single derived value keeps the bar on one code path.
+  const progressPercent = $derived(
+    progress?.percent ??
+      (progress?.totalBytes ? progress.bytesWritten / progress.totalBytes : null),
+  );
   let tasks = $state<TaskSummary[]>([]);
   let settings = $state<Settings>({ schemaVersion: 1, extractorPolicy: 'auto', allowPathLookup: false, logLevel: 'INFO' });
   let activeTab = $state('download');
@@ -33,7 +40,7 @@
     // browser preview loses the task list and every later effect in the flush.
     if (!isDesktop) return;
     let unlisten: (() => void) | undefined;
-    listen<{ bytesWritten: number; totalBytes?: number; bytesPerSecond: number }>('task://progress', (event) => {
+    listen<TaskProgress>('task://progress', (event) => {
       progress = event.payload;
     }).then((dispose) => { unlisten = dispose; });
     listTasks().then((items) => { tasks = items; }).catch(() => { /* backend not ready */ });
@@ -61,32 +68,72 @@
     if (!value) { notice = '请先粘贴一个 http(s) 视频链接。'; return; }
     probing = true;
     manifest = null;
-    selectedFormat = null;
+    selectedOption = null;
     notice = '正在调用 yt-dlp 解析格式…';
     // A probe started from another tab has its result on the download tab, so
     // move there rather than leaving the user watching an unrelated panel.
     activeTab = 'download';
     try {
       manifest = await probeUrl(value);
-      notice = `解析完成：${manifest.formats.length} 个格式，后端 ${manifest.backendVersion}`;
+      notice = `解析完成：${manifest.downloadOptions.length} 个可选画质，后端 ${manifest.backendVersion}`;
     } catch (error) {
-      notice = error instanceof Error ? error.message : '解析失败，请检查链接或后端状态。';
+      notice = errorMessage(error, '解析失败，请检查链接或后端状态。');
     } finally { probing = false; }
   }
 
-  async function startDownload(format: MediaFormat) {
+  // The configured directory wins; the system Downloads folder is only the
+  // fallback for a fresh install that never opened the settings tab. Trimming
+  // matters because the field is free text: a stray space would otherwise be
+  // sent as a path component.
+  async function resolveDownloadDirectory(): Promise<string> {
+    const configured = settings.downloadDirectory?.trim();
+    return configured || (await downloadDir());
+  }
+
+  async function startDownload(option: DownloadOption) {
     downloading = true;
+    selectedOption = option;
     progress = null;
-    notice = format.delivery.kind === 'direct' ? '正在下载…' : '正在用 ffmpeg 处理流媒体…';
+    notice = option.plan.kind === 'progressive' ? '正在下载…' : '正在用 ffmpeg 合流…';
     try {
-      const directory = await downloadDir();
-      const result = format.delivery.kind === 'direct'
-        ? await downloadDirect({ url: format.delivery.url, formatId: format.formatId, outputDirectory: directory, fileName: manifest?.title, httpHeaders: format.httpHeaders })
-        : await downloadStream({ url: format.delivery.kind === 'hls' ? format.delivery.playlistUrl : format.delivery.manifestUrl, outputDirectory: directory, fileName: manifest?.title ?? 'autofox-download' });
-      notice = `下载完成：${result.outputPath}`;
+      const directory = await resolveDownloadDirectory();
+      const fileName = `${manifest?.title ?? 'autofox-download'} ${option.label}`;
+      let outputPath: string;
+      if (option.plan.kind === 'progressive') {
+        const result = await downloadDirect({
+          url: option.plan.url,
+          formatId: option.plan.formatId,
+          outputDirectory: directory,
+          fileName,
+          httpHeaders: headersFor(option.plan.formatId),
+        });
+        outputPath = result.outputPath;
+      } else if (option.plan.kind === 'merge') {
+        // Video-only and audio-only streams are useless on their own, so the
+        // two URLs go straight to ffmpeg's stream-copy path.
+        const result = await muxStreams({
+          videoUrl: option.plan.videoUrl,
+          audioUrl: option.plan.audioUrl,
+          outputDirectory: directory,
+          fileName,
+          container: option.container,
+          httpHeaders: headersFor(option.plan.videoFormatId),
+          durationSecs: manifest?.durationSecs,
+        });
+        outputPath = result.outputPath;
+      } else {
+        const result = await downloadStream({ url: option.plan.url, outputDirectory: directory, fileName, durationSecs: manifest?.durationSecs });
+        outputPath = result.outputPath;
+      }
+      notice = `下载完成：${outputPath}`;
     } catch (error) {
-      notice = error instanceof Error ? error.message : '下载失败，请重试。';
+      notice = errorMessage(error, '下载失败，请重试。');
     } finally { downloading = false; }
+  }
+
+  // The plan carries only URLs, so headers come from the raw row it came from.
+  function headersFor(formatId: string): Record<string, string> {
+    return manifest?.formats.find((format) => format.formatId === formatId)?.httpHeaders ?? {};
   }
 
   async function refreshTasks() {
@@ -100,7 +147,7 @@
     await refreshTasks();
   }
 
-  function formatSize(size: MediaManifest['formats'][number]['size']) {
+  function formatSize(size: SizeHint) {
     if (size.kind === 'unknown') return '未知';
     const units = ['B', 'KB', 'MB', 'GB']; let value = size.bytes; let unit = 0;
     while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
@@ -110,7 +157,23 @@
   function formatSpeed(bytes: number) { return `${formatSize({ kind: 'exact', bytes })}/s`; }
 
   async function persistSettings() {
-    try { await saveSettings(settings); notice = '设置已保存。'; } catch (error) { notice = error instanceof Error ? error.message : '设置保存失败。'; }
+    try { await saveSettings(settings); notice = '设置已保存。'; } catch (error) { notice = errorMessage(error, '设置保存失败。'); }
+  }
+
+  // The picker is a convenience over the text field, not a replacement: the
+  // field stays editable so a path can be pasted. `open` resolves to `null`
+  // when the user cancels, which must leave the current value untouched.
+  async function chooseDownloadDirectory() {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: settings.downloadDirectory ?? (await downloadDir()),
+      });
+      if (typeof selected === 'string') settings.downloadDirectory = selected;
+    } catch (error) {
+      notice = errorMessage(error, '无法打开目录选择器。');
+    }
   }
 </script>
 
@@ -143,29 +206,46 @@
           {#if manifest}
             <div class="panel-heading">
               <h2>{manifest.title}</h2>
-              <span class="meta">{manifest.producedBy} · {manifest.backendVersion} · {manifest.formats.length} 个格式</span>
+              <span class="meta">{manifest.producedBy} · {manifest.backendVersion} · {manifest.downloadOptions.length} 个可选画质</span>
             </div>
             {#if progress}
               <div class="progress-card">
                 <div class="progress-line">
-                  <span>{progress.totalBytes ? `${Math.round(progress.bytesWritten / progress.totalBytes * 100)}%` : formatSize({ kind: 'exact', bytes: progress.bytesWritten })}</span>
+                  <span>{progressPercent === null ? formatSize({ kind: 'exact', bytes: progress.bytesWritten }) : `${Math.round(progressPercent * 100)}%`}</span>
                   <span>{formatSpeed(progress.bytesPerSecond)}</span>
                 </div>
-                <Progress value={progress.bytesWritten} max={progress.totalBytes ?? progress.bytesWritten} label="下载进度" />
+                <!-- With no percent the total is unknown, so the bar would read
+                     value == max and look finished. Keep it at zero and let the
+                     byte counter carry the signal instead. -->
+                <Progress value={progressPercent ?? 0} max={1} label="下载进度" />
               </div>
             {/if}
             <div class="rows">
-              {#each manifest.formats as format (format.formatId)}
+              {#each manifest.downloadOptions as option (option.optionId)}
                 <article class="row">
-                  <div><strong>{format.formatId}</strong><small>{format.container} · {format.delivery.kind}{format.video?.width ? ` · ${format.video.width}×${format.video.height}` : ''}</small></div>
+                  <div><strong>{option.label}</strong><small>{option.detail}</small></div>
                   <div class="row-meta">
-                    <Badge variant="outline">{format.video?.codec ?? 'audio'}{format.audio ? ` + ${format.audio.codec}` : ''}</Badge>
-                    <span class="size">{formatSize(format.size)}</span>
-                    <Button variant="outline" onclick={() => { selectedFormat = format; startDownload(format); }} disabled={probing || downloading}>{downloading && selectedFormat?.formatId === format.formatId ? '下载中…' : '下载'}</Button>
+                    <Badge variant="outline">{option.container.toUpperCase()}</Badge>
+                    <span class="size">{formatSize(option.size)}</span>
+                    <Button onclick={() => startDownload(option)} disabled={probing || downloading}>{downloading && selectedOption?.optionId === option.optionId ? '下载中…' : '下载'}</Button>
                   </div>
                 </article>
               {/each}
             </div>
+            <details class="advanced">
+              <summary>全部原始格式（{manifest.formats.length}）</summary>
+              <div class="rows">
+                {#each manifest.formats as format (format.formatId)}
+                  <article class="row">
+                    <div><strong>{format.formatId}</strong><small>{format.container} · {format.delivery.kind}{format.video?.width ? ` · ${format.video.width}×${format.video.height}` : ''}</small></div>
+                    <div class="row-meta">
+                      <Badge variant="outline">{format.video?.codec ?? format.audio?.codec ?? '无媒体轨'}</Badge>
+                      <span class="size">{formatSize(format.size)}</span>
+                    </div>
+                  </article>
+                {/each}
+              </div>
+            </details>
           {:else}
             <Empty title="还没有解析结果" description="在上方粘贴链接并点击开始解析，可用格式会列在这里。" />
           {/if}
@@ -204,6 +284,13 @@
         {:else if id === 'settings'}
           <div class="panel-heading"><h2>设置</h2></div>
           <div class="fields">
+            <div class="field-group">
+              <label for="download-directory">下载目录</label>
+              <div class="path-field">
+                <input id="download-directory" value={settings.downloadDirectory ?? ''} onchange={(event) => (settings.downloadDirectory = (event.currentTarget as HTMLInputElement).value.trim() || undefined)} placeholder="默认使用系统下载目录" />
+                <Button variant="outline" onclick={chooseDownloadDirectory}>浏览…</Button>
+              </div>
+            </div>
             <label>解析策略
               <select value={settings.extractorPolicy} onchange={(event) => (settings.extractorPolicy = (event.currentTarget as HTMLSelectElement).value as Settings['extractorPolicy'])}>
                 <option value="auto">自动</option>
@@ -287,6 +374,11 @@
   .size { color: var(--muted-foreground); font-size: .72rem; font-variant-numeric: tabular-nums; }
   .named { display: flex; align-items: center; gap: .65rem; }
 
+  .advanced { margin-top: var(--space-md); border-top: 1px solid var(--border); }
+  .advanced summary { padding: .7rem 0; color: var(--muted-foreground); cursor: pointer; font-size: .72rem; }
+  .advanced summary:hover { color: var(--foreground); }
+  .advanced summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
   .progress-card { padding: var(--space-sm) 0 var(--space-md); }
   .progress-line { display: flex; justify-content: space-between; margin-bottom: .4rem; font-family: var(--font-mono); font-size: .72rem; font-variant-numeric: tabular-nums; }
 
@@ -295,6 +387,13 @@
   .fields select, .fields input { width: 100%; min-height: 2.75rem; padding: 0 .7rem; border: 1px solid var(--input); border-radius: .6rem; background: var(--background); color: var(--foreground); font: inherit; font-weight: 400; outline: 2px solid transparent; outline-offset: 1px; }
   .fields select:focus-visible, .fields input:focus-visible { outline-color: var(--ring); }
   .fields input::placeholder { color: var(--muted-foreground); }
+  /* The directory row pairs free-text input with a picker button, so its label
+     sits outside the control. This group restores the label-to-input spacing
+     that `.fields label` gives the plain fields. */
+  .field-group { display: grid; gap: .3rem; }
+  .field-group label { font-size: .75rem; font-weight: 650; }
+  .path-field { display: flex; gap: var(--space-xs); align-items: center; }
+  .path-field input { flex: 1 1 auto; min-width: 0; }
   @media (hover: hover) {
     .fields select:hover, .fields input:hover { background: var(--muted); }
   }
