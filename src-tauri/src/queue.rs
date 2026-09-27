@@ -1,5 +1,9 @@
 //! Download task registry and lifecycle controls.
 
+#[cfg(test)]
+#[path = "queue_tests.rs"]
+mod queue_tests;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -49,6 +53,9 @@ struct TaskRecord {
     cancel: Arc<AtomicBool>,
 }
 
+/// Downloads allowed to run at once. The queue reports `Busy` beyond it.
+const MAX_ACTIVE_TASKS: usize = 4;
+
 /// Process-wide task registry managed by Tauri.
 #[derive(Default)]
 pub struct TaskRegistry {
@@ -56,7 +63,7 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
-    pub fn persist(&self, app: &tauri::AppHandle) {
+    pub fn persist<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>) {
         use tauri::Manager;
         let Ok(dir) = app.path().app_config_dir() else {
             return;
@@ -71,7 +78,7 @@ impl TaskRegistry {
         let _ = fs::write(path, text);
     }
 
-    pub fn load(&self, app: &tauri::AppHandle) {
+    pub fn load<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>) {
         use tauri::Manager;
         let Ok(dir) = app.path().app_config_dir() else {
             return;
@@ -100,21 +107,32 @@ impl TaskRegistry {
     }
 
     /// Registers a running task, enforcing the four-task process limit.
-    /// Registers a running task.
-    pub fn start(
+    ///
+    /// Persisting is deliberately *not* done inside [`Self::register`]: the
+    /// only writer of `tasks.json` is [`Self::persist`], which re-locks
+    /// `records` through [`Self::list`]. `Mutex` is not reentrant, so reaching
+    /// `persist` while the guard is alive blocks the caller forever with no
+    /// error and no log line. Keeping the lock inside `register` and the file
+    /// write out here makes that shape unrepresentable.
+    pub fn start<R: tauri::Runtime>(
         &self,
         kind: &str,
-        app: Option<&tauri::AppHandle>,
+        app: Option<&tauri::AppHandle<R>>,
     ) -> Result<(String, Arc<AtomicBool>), IpcError> {
+        let started = self.register(kind)?;
+        if let Some(app) = app {
+            self.persist(app);
+        }
+        Ok(started)
+    }
+
+    /// Inserts a `Downloading` record, or reports `Busy` at the task limit.
+    ///
+    /// Holds the registry lock for its whole body and touches no other state,
+    /// so it cannot reach a second `lock` call.
+    fn register(&self, kind: &str) -> Result<(String, Arc<AtomicBool>), IpcError> {
         let task_id = Uuid::new_v4().to_string();
         let cancel = Arc::new(AtomicBool::new(false));
-        let summary = TaskSummary {
-            task_id: task_id.clone(),
-            kind: kind.to_owned(),
-            state: TaskState::Downloading,
-            output_path: None,
-            error_key: None,
-        };
         let mut records = self
             .records
             .lock()
@@ -123,7 +141,7 @@ impl TaskRegistry {
             .values()
             .filter(|record| record.summary.state == TaskState::Downloading)
             .count()
-            >= 4
+            >= MAX_ACTIVE_TASKS
         {
             return Err(IpcError {
                 code: ErrorCode::Busy,
@@ -136,15 +154,19 @@ impl TaskRegistry {
         records.insert(
             task_id.clone(),
             TaskRecord {
-                summary,
+                summary: TaskSummary {
+                    task_id: task_id.clone(),
+                    kind: kind.to_owned(),
+                    state: TaskState::Downloading,
+                    output_path: None,
+                    error_key: None,
+                },
                 cancel: cancel.clone(),
             },
         );
-        if let Some(app) = app {
-            self.persist(app);
-        }
         Ok((task_id, cancel))
     }
+
     /// Returns whether a task was cancelled.
     pub fn is_cancelled(&self, task_id: &str) -> bool {
         self.records
