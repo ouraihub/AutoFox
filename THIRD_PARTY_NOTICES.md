@@ -1,6 +1,6 @@
 # AutoFox Third-Party Notices
 
-Generated: 2026-09-26
+Generated: 2026-10-25
 
 This inventory is a release-review input, not a substitute for reviewing each license text.
 
@@ -19,6 +19,7 @@ This inventory is a release-review input, not a substitute for reviewing each li
 | @tauri-apps/plugin-opener | 2.5.5 |
 | @eslint/js | 10.0.1 |
 | @lucide/svelte | 1.31.0 |
+| @ouraihub/desktop-kit | github:ouraihub/desktop-kit#c7c8281885dc0e88293abda4f67fd5570dee37db |
 | @sveltejs/adapter-static | 3.0.10 |
 | @sveltejs/kit | 2.70.3 |
 | @sveltejs/vite-plugin-svelte | 7.3.0 |
