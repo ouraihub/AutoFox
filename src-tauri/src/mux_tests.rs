@@ -1,6 +1,13 @@
 //! Mux tests: real ffmpeg, real HTTP, no network.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use tokio::net::TcpListener;
 
@@ -110,6 +117,7 @@ async fn writes_a_real_mp4_through_the_part_file() {
             http_headers: Default::default(),
             duration_secs: None,
         },
+        &AtomicBool::new(false),
         |_| {},
     )
     .await
@@ -146,6 +154,7 @@ async fn writes_a_real_webm_when_the_option_asks_for_one() {
             http_headers: Default::default(),
             duration_secs: None,
         },
+        &AtomicBool::new(false),
         |_| {},
     )
     .await
@@ -174,11 +183,73 @@ async fn rejects_a_container_it_cannot_mux() {
             http_headers: Default::default(),
             duration_secs: None,
         },
+        &AtomicBool::new(false),
         |_| {},
     )
     .await
     .expect_err("mkv is not offered by the option list");
     assert_eq!(error.field, Some("container"));
+    let _ = tokio::fs::remove_dir_all(out).await;
+}
+
+/// Accepts connections and never answers, so ffmpeg blocks on its first read
+/// exactly like a stalled CDN: the case the 200ms cancel watch exists for.
+async fn stall() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    format!("http://{address}")
+}
+
+/// Cancel must stop ffmpeg promptly, report `Cancelled` (not `Failed`), and
+/// leave no `.part`. The `.part` is seeded beforehand so the cleanup assertion
+/// cannot pass just because ffmpeg never got far enough to create one.
+#[tokio::test]
+async fn cancel_kills_ffmpeg_and_removes_the_part_file() {
+    let base = stall().await;
+    let out = std::env::temp_dir().join(format!("autofox-mux-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&out).await.expect("mkdir");
+    let part = out.join("merged.mp4.part");
+    tokio::fs::write(&part, b"stale").await.expect("seed part");
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancel);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        flag.store(true, Ordering::Relaxed);
+    });
+    let started = std::time::Instant::now();
+    let error = mux_streams_inner(
+        None,
+        MuxRequest {
+            video_url: format!("{base}/v.mp4"),
+            audio_url: format!("{base}/a.mp4"),
+            output_directory: out.to_string_lossy().into_owned(),
+            file_name: "merged".to_owned(),
+            container: "mp4".to_owned(),
+            http_headers: Default::default(),
+            duration_secs: None,
+        },
+        &cancel,
+        |_| {},
+    )
+    .await
+    .expect_err("a cancelled mux must not succeed");
+    let took = started.elapsed();
+
+    assert_eq!(error.code, crate::ipc::ErrorCode::Cancelled);
+    // 300ms until cancel + 200ms poll + kill; 1.5s leaves CI headroom while
+    // still failing loudly if cancel waited for the 30-minute timeout.
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "cancel took {took:?}"
+    );
+    assert!(!part.exists(), "cancelled mux left its .part behind");
     let _ = tokio::fs::remove_dir_all(out).await;
 }
 
@@ -257,13 +328,19 @@ async fn reports_progress_while_ffmpeg_is_still_running() {
     let started = std::time::Instant::now();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Option<f64>, f64)>::new()));
     let collected = std::sync::Arc::clone(&seen);
-    let output = super::run_with_progress(command, "mux", Some(2.0), move |event| {
-        let at = started.elapsed().as_secs_f64();
-        collected
-            .lock()
-            .expect("sink lock")
-            .push((event.percent, at));
-    })
+    let output = super::run_with_progress(
+        command,
+        "mux",
+        Some(2.0),
+        &AtomicBool::new(false),
+        move |event| {
+            let at = started.elapsed().as_secs_f64();
+            collected
+                .lock()
+                .expect("sink lock")
+                .push((event.percent, at));
+        },
+    )
     .await
     .expect("ffmpeg should run");
     let finished_at = started.elapsed().as_secs_f64();
@@ -296,6 +373,57 @@ async fn reports_progress_while_ffmpeg_is_still_running() {
     assert!(
         percents.iter().all(|percent| (0.0..=1.0).contains(percent)),
         "percent must stay a fraction: {reports:?}"
+    );
+    let _ = tokio::fs::remove_file(&out).await;
+}
+
+/// Dropping the runner (what `timeout` does on expiry) must kill ffmpeg.
+/// ffmpeg ignores the closed progress pipe, so without `kill_on_drop` a paced
+/// encode keeps growing its output after the task is gone.
+#[tokio::test]
+async fn dropping_the_runner_kills_ffmpeg() {
+    let ffmpeg = crate::system::paths::bundled_ffmpeg().expect("ffmpeg path");
+    let out = std::env::temp_dir().join(format!("autofox-drop-{}.ts", uuid::Uuid::new_v4()));
+    let mut command = tokio::process::Command::new(ffmpeg);
+    command
+        .args(["-hide_banner", "-v", "error", "-y", "-re", "-f", "lavfi"])
+        .args([
+            "-i",
+            "testsrc=size=64x64:rate=8:duration=30",
+            "-c:v",
+            // Intra-only: x264's lookahead buffers ~5s at 8fps, so it would
+            // write nothing inside the window and the test would prove nothing.
+            "mjpeg",
+        ])
+        .args([
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "0.5",
+            // ffmpeg buffers 32 KiB before writing; tiny frames stay under that
+            // for seconds, which would read as "not writing" either way.
+            "-flush_packets",
+            "1",
+            "-f",
+            "avi",
+        ])
+        .arg(out.to_string_lossy().as_ref())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let never = AtomicBool::new(false);
+    let run = super::run_with_progress(command, "drop", None, &never, |_| {});
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), run).await;
+
+    // Give a live process time to flush more packets, then require no growth.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let before = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let after = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    assert!(before > 0, "ffmpeg never started writing");
+    assert_eq!(
+        before, after,
+        "ffmpeg kept writing after the runner was dropped"
     );
     let _ = tokio::fs::remove_file(&out).await;
 }

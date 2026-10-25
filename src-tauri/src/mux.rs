@@ -4,7 +4,11 @@
 #[path = "mux_tests.rs"]
 mod mux_tests;
 
-use std::{path::PathBuf, process::Stdio};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -64,36 +68,45 @@ pub async fn download_stream(
     state: tauri::State<'_, crate::queue::TaskRegistry>,
     request: StreamRequest,
 ) -> Result<MuxResult, IpcError> {
-    let (task_id, _cancel) = state.start("stream", Some(&app))?;
+    let (task_id, cancel) = state.start("stream", Some(&app))?;
     logs::info(
         TARGET,
         format!("stream task {task_id}: {}", logs::redact_url(&request.url)),
     );
-    let result = download_stream_inner(Some(&app), request).await;
-    match &result {
+    let result = download_stream_inner(Some(&app), request, &cancel).await;
+    record_outcome(&state, &task_id, &result);
+    result
+}
+
+/// Moves a stream/mux task terminal: user cancel is `Cancelled` and a warn,
+/// anything else `Failed` and an error, same mapping as `download.rs`.
+fn record_outcome(
+    state: &crate::queue::TaskRegistry,
+    task_id: &str,
+    result: &Result<MuxResult, IpcError>,
+) {
+    use crate::queue::TaskState;
+    match result {
         Ok(value) => {
-            logs::info(TARGET, format!("stream task {task_id} finished"));
+            logs::info(TARGET, format!("task {task_id} finished"));
             state.finish(
-                &task_id,
-                crate::queue::TaskState::Done,
+                task_id,
+                TaskState::Done,
                 Some(value.output_path.clone()),
                 None,
             );
         }
         Err(error) => {
-            logs::error(
-                TARGET,
-                format!("stream task {task_id} failed: {}", error.detail),
-            );
-            state.finish(
-                &task_id,
-                crate::queue::TaskState::Failed,
-                None,
-                Some(error.message_key.to_owned()),
-            );
+            let terminal = if error.code == ErrorCode::Cancelled {
+                logs::warn(TARGET, format!("task {task_id} cancelled"));
+                TaskState::Cancelled
+            } else {
+                logs::error(TARGET, format!("task {task_id} failed: {}", error.detail));
+                TaskState::Failed
+            };
+            state.finish(task_id, terminal, None, Some(error.message_key.to_owned()));
         }
     }
-    result
 }
 
 /// One manifest stream passed to ffmpeg.
@@ -115,6 +128,7 @@ pub struct StreamRequest {
 async fn download_stream_inner(
     app: Option<&tauri::AppHandle>,
     request: StreamRequest,
+    cancel: &AtomicBool,
 ) -> Result<MuxResult, IpcError> {
     let input = validate_http_url(&request.url, "url")?;
     let duration_secs = request.duration_secs;
@@ -163,12 +177,13 @@ async fn download_stream_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_with_progress(command, "mux", duration_secs, |event| {
+    let output = run_with_progress(command, "mux", duration_secs, cancel, |event| {
         if let Some(app) = app {
             let _ = tauri::Emitter::emit(app, "task://progress", event);
         }
     })
-    .await?;
+    .await
+    .inspect_err(|error| discard_partial(error, &temp_path))?;
     if !output.status.success() {
         return Err(IpcError {
             code: ErrorCode::MuxFailed,
@@ -203,9 +218,13 @@ async fn run_with_progress(
     mut command: Command,
     task_id: &str,
     duration_secs: Option<f64>,
+    cancel: &AtomicBool,
     mut sink: impl FnMut(crate::download::DownloadProgress),
 ) -> Result<std::process::Output, IpcError> {
+    // Every early return below (timeout, pipe error, cancel) drops `child`;
+    // without this the ffmpeg process outlives the task and keeps writing.
     let mut child = command
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| internal(error.to_string()))?;
     let stdout = child
@@ -267,9 +286,26 @@ async fn run_with_progress(
         Ok::<(), IpcError>(())
     };
 
-    timeout(MUX_TIMEOUT, pump)
-        .await
-        .map_err(|_| timed_out())??;
+    // The pump only wakes on ffmpeg output, so cancellation cannot be checked
+    // inside the loop alone: a stalled CDN read would ignore the flag until the
+    // 30-minute timeout. Polling in parallel bounds the reaction to 200ms.
+    let watch = async {
+        while !cancel.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    let pumped = tokio::select! {
+        result = timeout(MUX_TIMEOUT, pump) => result.map_err(|_| timed_out())?,
+        () = watch => Err(cancelled()),
+    };
+    if let Err(error) = pumped {
+        // ffmpeg ignores a closed stdout, so the process must be killed
+        // explicitly or it keeps writing the `.part` file to completion.
+        if error.code == ErrorCode::Cancelled {
+            let _ = child.kill().await;
+        }
+        return Err(error);
+    }
     let status = timeout(MUX_TIMEOUT, child.wait())
         .await
         .map_err(|_| timed_out())?
@@ -286,27 +322,30 @@ async fn run_with_progress(
 #[tauri::command]
 pub async fn mux_streams(
     app: tauri::AppHandle,
+    state: tauri::State<'_, crate::queue::TaskRegistry>,
     request: MuxRequest,
 ) -> Result<MuxResult, IpcError> {
+    let (task_id, cancel) = state.start("mux", Some(&app))?;
     logs::info(
         TARGET,
         format!(
-            "muxing video {} with audio {}",
+            "mux task {task_id}: video {} with audio {}",
             logs::redact_url(&request.video_url),
             logs::redact_url(&request.audio_url)
         ),
     );
-    mux_streams_inner(Some(&app), request, |event| {
+    let result = mux_streams_inner(Some(&app), request, &cancel, |event| {
         let _ = tauri::Emitter::emit(&app, "task://progress", event);
     })
-    .await
-    .inspect(|_| logs::info(TARGET, "mux finished"))
-    .inspect_err(|error| logs::error(TARGET, format!("mux failed: {}", error.detail)))
+    .await;
+    record_outcome(&state, &task_id, &result);
+    result
 }
 
 async fn mux_streams_inner(
     app: Option<&tauri::AppHandle>,
     request: MuxRequest,
+    cancel: &AtomicBool,
     sink: impl FnMut(crate::download::DownloadProgress),
 ) -> Result<MuxResult, IpcError> {
     let video = validate_http_url(&request.video_url, "videoUrl")?;
@@ -381,7 +420,9 @@ async fn mux_streams_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_with_progress(command, "mux", request.duration_secs, sink).await?;
+    let output = run_with_progress(command, "mux", request.duration_secs, cancel, sink)
+        .await
+        .inspect_err(|error| discard_partial(error, &temp_path))?;
     if !output.status.success() {
         // ffmpeg's own diagnosis is the only way to tell a dead CDN URL from a
         // codec the container rejects, and it never contains the signed query.
@@ -490,6 +531,34 @@ fn io_error(detail: String) -> IpcError {
         field: None,
         retryable: true,
         detail,
+    }
+}
+
+/// Removes the `.part` file left behind by a killed ffmpeg.
+///
+/// A `-c copy` output cut mid-write has no trailing index, so it is neither
+/// playable nor resumable: keeping it would only strand bytes on disk. Only
+/// cancellation is cleaned up -- a failure's partial output is evidence, and
+/// `-y` overwrites it on the next attempt anyway.
+fn discard_partial(error: &IpcError, temp_path: &Path) {
+    if error.code != ErrorCode::Cancelled {
+        return;
+    }
+    match std::fs::remove_file(temp_path) {
+        Ok(()) => logs::info(TARGET, "discarded incomplete output after cancel"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => logs::warn(TARGET, format!("cannot remove incomplete output: {error}")),
+    }
+}
+/// Matches `download.rs`: cancellation is a distinct code so the queue can move
+/// the task to `Cancelled` instead of `Failed`.
+fn cancelled() -> IpcError {
+    IpcError {
+        code: ErrorCode::Cancelled,
+        message_key: "errors.cancelled",
+        field: None,
+        retryable: false,
+        detail: "mux cancelled".to_owned(),
     }
 }
 fn timed_out() -> IpcError {
