@@ -199,6 +199,13 @@ impl TaskRegistry {
         let started = self.register(kind)?;
         if let Some(app) = app {
             self.persist(app);
+            // The task list refreshes on `task://state`; without this a new
+            // task stayed invisible until it finished or the user hit refresh.
+            let _ = tauri::Emitter::emit(
+                app,
+                "task://state",
+                serde_json::json!({ "taskId": started.0, "state": "downloading" }),
+            );
         }
         Ok(started)
     }

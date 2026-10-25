@@ -151,7 +151,12 @@
       notice = `下载完成：${outputPath}`;
     } catch (error) {
       notice = errorMessage(error, '下载失败，请重试。');
-    } finally { downloading = false; }
+    } finally {
+      downloading = false;
+      // Not every terminal path emits `task://state` (failures, stream
+      // downloads), but every one returns here, so the row never stays stale.
+      void refreshTasks();
+    }
   }
 
   // The plan carries only URLs, so headers come from the raw row it came from.
