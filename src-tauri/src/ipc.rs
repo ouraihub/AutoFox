@@ -40,6 +40,7 @@ pub enum ErrorCode {
     MuxerMissing,
     /// The requested task or resource was not found.
     NotFound,
+    /// A concurrency limit is already saturated.
     Busy,
     /// An unexpected internal error occurred.
     Internal,
@@ -70,6 +71,81 @@ impl IpcError {
             field: None,
             retryable: false,
             detail: detail.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorCode;
+
+    /// The TypeScript client hand-maintains a union mirroring [`ErrorCode`].
+    /// Nothing at either compiler's disposal links the two, so a variant added
+    /// here silently reaches the frontend as an unhandled string. `NotFound`
+    /// already drifted that way. The `match` below is exhaustive on purpose:
+    /// adding a variant fails to compile until it is listed, and the listed
+    /// name is then required to appear in the union.
+    #[test]
+    fn typescript_union_covers_every_variant() {
+        const CLIENT_TS: &str = include_str!("../../src/lib/ipc/client.ts");
+
+        let all = [
+            ErrorCode::Validation,
+            ErrorCode::NoBackendAvailable,
+            ErrorCode::BackendUnavailable,
+            ErrorCode::BackendProtocol,
+            ErrorCode::Unsupported,
+            ErrorCode::ExtractionFailed,
+            ErrorCode::AuthRequired,
+            ErrorCode::GeoRestricted,
+            ErrorCode::FormatUnavailable,
+            ErrorCode::Network,
+            ErrorCode::TimedOut,
+            ErrorCode::Cancelled,
+            ErrorCode::DiskFull,
+            ErrorCode::AtomicWrite,
+            ErrorCode::MuxFailed,
+            ErrorCode::MuxerMissing,
+            ErrorCode::NotFound,
+            ErrorCode::Busy,
+            ErrorCode::Internal,
+        ];
+
+        let union = CLIENT_TS
+            .split_once("export type ErrorCode =")
+            .expect("client.ts declares an ErrorCode union")
+            .1
+            .split_once(';')
+            .expect("the union declaration is terminated")
+            .0;
+
+        for code in all {
+            // Exhaustiveness: a new variant must be added to `all` to compile.
+            let name = match code {
+                ErrorCode::Validation => "Validation",
+                ErrorCode::NoBackendAvailable => "NoBackendAvailable",
+                ErrorCode::BackendUnavailable => "BackendUnavailable",
+                ErrorCode::BackendProtocol => "BackendProtocol",
+                ErrorCode::Unsupported => "Unsupported",
+                ErrorCode::ExtractionFailed => "ExtractionFailed",
+                ErrorCode::AuthRequired => "AuthRequired",
+                ErrorCode::GeoRestricted => "GeoRestricted",
+                ErrorCode::FormatUnavailable => "FormatUnavailable",
+                ErrorCode::Network => "Network",
+                ErrorCode::TimedOut => "TimedOut",
+                ErrorCode::Cancelled => "Cancelled",
+                ErrorCode::DiskFull => "DiskFull",
+                ErrorCode::AtomicWrite => "AtomicWrite",
+                ErrorCode::MuxFailed => "MuxFailed",
+                ErrorCode::MuxerMissing => "MuxerMissing",
+                ErrorCode::NotFound => "NotFound",
+                ErrorCode::Busy => "Busy",
+                ErrorCode::Internal => "Internal",
+            };
+            assert!(
+                union.contains(&format!("'{name}'")),
+                "client.ts ErrorCode union is missing {name}"
+            );
         }
     }
 }
