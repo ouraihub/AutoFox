@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ipc::{ErrorCode, IpcError};
+use crate::logs;
+
+const TARGET: &str = "queue";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -63,38 +66,71 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
+    /// Writes the task snapshot list to `tasks.json`.
+    ///
+    /// Persistence is best-effort: a failure must not abort the download that
+    /// triggered it. Every failure path is logged, because a silent one leaves
+    /// the queue looking healthy while `tasks.json` silently goes stale.
     pub fn persist<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>) {
         use tauri::Manager;
         let Ok(dir) = app.path().app_config_dir() else {
+            logs::warn(TARGET, "cannot persist tasks: no app config directory");
             return;
         };
-        if fs::create_dir_all(&dir).is_err() {
+        if let Err(error) = fs::create_dir_all(&dir) {
+            logs::warn(
+                TARGET,
+                format!("cannot persist tasks: config directory unusable: {error}"),
+            );
             return;
         }
         let path = dir.join("tasks.json");
-        let Ok(text) = serde_json::to_string_pretty(&self.list()) else {
-            return;
+        let text = match serde_json::to_string_pretty(&self.list()) {
+            Ok(text) => text,
+            Err(error) => {
+                logs::error(TARGET, format!("cannot serialize task snapshots: {error}"));
+                return;
+            }
         };
-        let _ = fs::write(path, text);
+        if let Err(error) = fs::write(path, text) {
+            logs::warn(TARGET, format!("cannot write tasks.json: {error}"));
+        }
     }
 
+    /// Restores task snapshots from `tasks.json` at startup.
+    ///
+    /// A missing file is the normal first-run state and stays silent. Every
+    /// other failure is logged: losing the queue without a trace looks
+    /// identical to "the user never downloaded anything".
     pub fn load<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>) {
         use tauri::Manager;
         let Ok(dir) = app.path().app_config_dir() else {
+            logs::warn(TARGET, "cannot restore tasks: no app config directory");
             return;
         };
-        let Ok(text) = fs::read_to_string(dir.join("tasks.json")) else {
-            return;
+        let text = match fs::read_to_string(dir.join("tasks.json")) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                logs::warn(TARGET, format!("cannot read tasks.json: {error}"));
+                return;
+            }
         };
-        let Ok(summaries) = serde_json::from_str::<Vec<TaskSummary>>(&text) else {
-            return;
+        let summaries = match serde_json::from_str::<Vec<TaskSummary>>(&text) {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                logs::error(TARGET, format!("tasks.json is not parseable: {error}"));
+                return;
+            }
         };
         let Ok(mut records) = self.records.lock() else {
+            logs::error(TARGET, "cannot restore tasks: registry lock poisoned");
             return;
         };
         if !records.is_empty() {
             return;
         }
+        let restored = summaries.len();
         for summary in summaries {
             records.insert(
                 summary.task_id.clone(),
@@ -104,6 +140,8 @@ impl TaskRegistry {
                 },
             );
         }
+        drop(records);
+        logs::info(TARGET, format!("restored {restored} task snapshot(s)"));
     }
 
     /// Registers a running task, enforcing the four-task process limit.
@@ -167,20 +205,32 @@ impl TaskRegistry {
         Ok((task_id, cancel))
     }
 
-    /// Returns whether a task was cancelled.
+    /// Returns whether a task was cancelled, or is no longer worth running.
+    ///
+    /// Called once per downloaded chunk, so only the abnormal poisoned-lock
+    /// branch logs; a missing record is the ordinary "task was removed" case.
+    /// Both unreadable states answer `true`: stopping a download that no
+    /// longer has an owner is recoverable, writing bytes forever is not.
     pub fn is_cancelled(&self, task_id: &str) -> bool {
-        self.records
-            .lock()
-            .ok()
-            .and_then(|records| {
-                records
-                    .get(task_id)
-                    .map(|record| record.cancel.load(Ordering::Relaxed))
-            })
-            .unwrap_or(true)
+        let Ok(records) = self.records.lock() else {
+            logs::error(
+                TARGET,
+                format!("registry lock poisoned; stopping task {task_id}"),
+            );
+            return true;
+        };
+        records
+            .get(task_id)
+            .is_none_or(|record| record.cancel.load(Ordering::Relaxed))
     }
 
-    /// Marks a task terminal.
+    /// Marks a task terminal, but never overwrites a state the user chose.
+    ///
+    /// The registry is the single authority on lifecycle transitions. A worker
+    /// that is already cancelled or paused keeps running until its next
+    /// cancellation check, so its late `finish(Done)` would otherwise flip the
+    /// UI from "已取消" back to "已完成" and lose the user's decision. Only a
+    /// task still in `Downloading` may be moved to a terminal state.
     pub fn finish(
         &self,
         task_id: &str,
@@ -191,6 +241,16 @@ impl TaskRegistry {
         if let Ok(mut records) = self.records.lock()
             && let Some(record) = records.get_mut(task_id)
         {
+            if record.summary.state != TaskState::Downloading {
+                logs::info(
+                    TARGET,
+                    format!(
+                        "ignoring late {state:?} for task {task_id} already in {:?}",
+                        record.summary.state
+                    ),
+                );
+                return;
+            }
             record.summary.state = state;
             record.summary.output_path = output_path;
             record.summary.error_key = error_key;

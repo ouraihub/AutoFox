@@ -140,3 +140,94 @@ fn a_paused_task_does_not_hold_a_slot_open_forever() {
         .state;
     assert_eq!(state, TaskState::Paused);
 }
+
+#[test]
+fn a_late_completion_does_not_overwrite_a_cancel() {
+    // The ffmpeg mux path keeps running after `cancel` sets the flag, so its
+    // `finish(Done)` lands afterwards. Before the guard this flipped the UI
+    // from 已取消 back to 已完成 and the user's decision was lost.
+    let registry = TaskRegistry::default();
+    let (task_id, cancel) = registry.register("stream").expect("first task registers");
+    registry
+        .cancel(&task_id, false)
+        .expect("an active task can be cancelled");
+    assert!(cancel.load(Ordering::Relaxed), "cancel flag should be set");
+
+    registry.finish(
+        &task_id,
+        TaskState::Done,
+        Some("D:\\out\\clip.mp4".to_owned()),
+        None,
+    );
+
+    let summary = registry
+        .list()
+        .into_iter()
+        .find(|s| s.task_id == task_id)
+        .expect("the cancelled task stays listed");
+    assert_eq!(summary.state, TaskState::Cancelled);
+    assert_eq!(
+        summary.output_path, None,
+        "a cancelled task must not gain an output path"
+    );
+}
+
+#[test]
+fn a_late_failure_does_not_overwrite_a_pause() {
+    // Pause cancels the in-flight HTTP stream, so the worker reports an error
+    // right after. Recording it would strand the task in `Failed` and make the
+    // retained `.part` file unresumable.
+    let registry = TaskRegistry::default();
+    let (task_id, _) = registry.register("direct").expect("first task registers");
+    registry
+        .cancel(&task_id, true)
+        .expect("an active task can be paused");
+
+    registry.finish(
+        &task_id,
+        TaskState::Failed,
+        None,
+        Some("errors.network".to_owned()),
+    );
+
+    let summary = registry
+        .list()
+        .into_iter()
+        .find(|s| s.task_id == task_id)
+        .expect("the paused task stays listed");
+    assert_eq!(summary.state, TaskState::Paused);
+    assert_eq!(
+        summary.error_key, None,
+        "pausing is not a failure and must not record an error key"
+    );
+}
+
+#[test]
+fn finish_still_records_the_first_terminal_result() {
+    // The guard must not block the ordinary path: a task that is still
+    // downloading accepts exactly one terminal transition, and a second one is
+    // then refused.
+    let registry = TaskRegistry::default();
+    let (task_id, _) = registry.register("direct").expect("first task registers");
+    registry.finish(
+        &task_id,
+        TaskState::Done,
+        Some("D:\\out\\first.mp4".to_owned()),
+        None,
+    );
+    registry.finish(
+        &task_id,
+        TaskState::Failed,
+        None,
+        Some("errors.network".to_owned()),
+    );
+
+    let summary = registry
+        .list()
+        .into_iter()
+        .find(|s| s.task_id == task_id)
+        .expect("the finished task stays listed");
+    assert_eq!(summary.state, TaskState::Done);
+    assert_eq!(summary.output_path.as_deref(), Some("D:\\out\\first.mp4"));
+    assert_eq!(summary.error_key, None);
+}
