@@ -16,15 +16,21 @@
     "check": "node scripts/check-node.mjs && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint . && pnpm run lint:css",
     "lint:css": "stylelint \"src/**/*.{css,svelte}\"",
-    "test:rust": "scripts\\cargo-msvc.bat test --workspace --locked",
-    "clippy": "scripts\\cargo-msvc.bat clippy --workspace --all-targets --locked -- -D warnings",
-    "fmt:rust": "scripts\\cargo-msvc.bat fmt --all -- --check",
-    "dev:app": "node scripts/check-node.mjs && scripts\\dev.bat",
-    "build:app": "node scripts/check-node.mjs && scripts\\build-app.bat",
+    "test:rust": "desktop-kit cargo test --workspace --locked",
+    "clippy": "desktop-kit cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "fmt:rust": "desktop-kit cargo fmt --all -- --check",
+    "dev:app": "node scripts/check-node.mjs && desktop-kit dev",
+    "build:app": "node scripts/check-node.mjs && desktop-kit build",
+    "clean": "desktop-kit clean",
     "generate:notice": "node scripts/generate-notice.mjs",
     "prepare:resources": "node scripts/prepare-resources.mjs",
     "tauri": "tauri",
     "verify": "pnpm run check && pnpm run lint && pnpm run test:rust && pnpm run clippy && pnpm run fmt:rust"
+  },
+  "desktopKit": {
+    "beforeBuild": ["generate:notice"],
+    "portable": { "files": ["yt-dlp.exe", "lib/ffmpeg.exe", "lib/ffprobe.exe"] },
+    "clean": { "paths": ["src-tauri/target", "src-tauri/gen", ".smoke"], "deepPaths": [".pnpm"] }
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
@@ -34,6 +40,7 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@lucide/svelte": "1.31.0",
+    "@ouraihub/desktop-kit": "github:ouraihub/desktop-kit#c7c8281885dc0e88293abda4f67fd5570dee37db",
     "@sveltejs/adapter-static": "3.0.10",
     "@sveltejs/kit": "2.70.3",
     "@sveltejs/vite-plugin-svelte": "7.3.0",
