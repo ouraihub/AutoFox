@@ -73,7 +73,7 @@ pub async fn download_stream(
         TARGET,
         format!("stream task {task_id}: {}", logs::redact_url(&request.url)),
     );
-    let result = download_stream_inner(Some(&app), request, &cancel).await;
+    let result = download_stream_inner(Some(&app), &task_id, request, &cancel).await;
     record_outcome(&state, &task_id, &result);
     result
 }
@@ -127,6 +127,7 @@ pub struct StreamRequest {
 
 async fn download_stream_inner(
     app: Option<&tauri::AppHandle>,
+    task_id: &str,
     request: StreamRequest,
     cancel: &AtomicBool,
 ) -> Result<MuxResult, IpcError> {
@@ -177,7 +178,7 @@ async fn download_stream_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_with_progress(command, "mux", duration_secs, cancel, |event| {
+    let output = run_with_progress(command, task_id, duration_secs, cancel, |event| {
         if let Some(app) = app {
             let _ = tauri::Emitter::emit(app, "task://progress", event);
         }
@@ -290,27 +291,43 @@ async fn run_with_progress(
 
     // The pump only wakes on ffmpeg output, so cancellation cannot be checked
     // inside the loop alone: a stalled CDN read would ignore the flag until the
-    // 30-minute timeout. Polling in parallel bounds the reaction to 200ms.
+    // 30-minute timeout. Polling in parallel bounds the reaction to 200ms, and
+    // the watch races the whole run, including `wait` after the pipes close.
     let watch = async {
         while !cancel.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     };
-    let pumped = tokio::select! {
-        result = timeout(MUX_TIMEOUT, pump) => result.unwrap_or_else(|_| Err(timed_out())),
+    let run = async {
+        pump.await?;
+        child
+            .wait()
+            .await
+            .map_err(|error| internal(error.to_string()))
+    };
+    let finished = tokio::select! {
+        result = timeout(MUX_TIMEOUT, run) => result.unwrap_or_else(|_| Err(timed_out())),
         () = watch => Err(cancelled()),
     };
-    if let Err(error) = pumped {
-        // ffmpeg ignores a closed stdout, so it must be killed on every early
-        // exit. Awaiting the kill also reaps it, which releases the Windows
-        // file lock before the caller deletes the `.part`.
-        let _ = child.kill().await;
-        return Err(error);
-    }
-    let status = timeout(MUX_TIMEOUT, child.wait())
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|error| internal(error.to_string()))?;
+    // A cancel that lands between exit and this check would otherwise let the
+    // caller rename the output while the registry already says `Cancelled`.
+    let finished = finished.and_then(|status| {
+        if cancel.load(Ordering::Relaxed) {
+            Err(cancelled())
+        } else {
+            Ok(status)
+        }
+    });
+    let status = match finished {
+        Ok(status) => status,
+        Err(error) => {
+            // ffmpeg ignores a closed stdout, so it must be killed on every
+            // early exit. Awaiting the kill also reaps it, which releases the
+            // Windows file lock before the caller deletes the `.part`.
+            let _ = child.kill().await;
+            return Err(error);
+        }
+    };
     let stderr = stderr_task.await.unwrap_or_default();
     Ok(std::process::Output {
         status,
@@ -335,7 +352,7 @@ pub async fn mux_streams(
             logs::redact_url(&request.audio_url)
         ),
     );
-    let result = mux_streams_inner(Some(&app), request, &cancel, |event| {
+    let result = mux_streams_inner(Some(&app), &task_id, request, &cancel, |event| {
         let _ = tauri::Emitter::emit(&app, "task://progress", event);
     })
     .await;
@@ -345,6 +362,7 @@ pub async fn mux_streams(
 
 async fn mux_streams_inner(
     app: Option<&tauri::AppHandle>,
+    task_id: &str,
     request: MuxRequest,
     cancel: &AtomicBool,
     sink: impl FnMut(crate::download::DownloadProgress),
@@ -421,7 +439,7 @@ async fn mux_streams_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_with_progress(command, "mux", request.duration_secs, cancel, sink)
+    let output = run_with_progress(command, task_id, request.duration_secs, cancel, sink)
         .await
         .inspect_err(|_| discard_partial(&temp_path))?;
     if !output.status.success() {

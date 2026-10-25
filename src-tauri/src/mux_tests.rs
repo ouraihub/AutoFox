@@ -106,8 +106,10 @@ async fn writes_a_real_mp4_through_the_part_file() {
     let video_url = format!("{}/v.mp4", serve(video, 4).await);
     let audio_url = format!("{}/a.mp4", serve(audio, 4).await);
     let out = std::env::temp_dir().join(format!("autofox-mux-{}", uuid::Uuid::new_v4()));
+    let mut event_ids = Vec::new();
     let result = mux_streams_inner(
         None,
+        "task-mp4",
         MuxRequest {
             video_url,
             audio_url,
@@ -118,10 +120,16 @@ async fn writes_a_real_mp4_through_the_part_file() {
             duration_secs: None,
         },
         &AtomicBool::new(false),
-        |_| {},
+        |event| event_ids.push(event.task_id),
     )
     .await
     .expect("mux should produce an mp4");
+    // Events carry the registry id, so the UI can tell concurrent muxes apart.
+    assert!(
+        !event_ids.is_empty(),
+        "ffmpeg always writes a final progress block"
+    );
+    assert!(event_ids.iter().all(|id| id == "task-mp4"), "{event_ids:?}");
 
     let bytes = tokio::fs::read(&result.output_path).await.expect("read");
     // `ftyp` is the MP4 signature: proof the container was chosen, not guessed.
@@ -145,6 +153,7 @@ async fn writes_a_real_webm_when_the_option_asks_for_one() {
     let out = std::env::temp_dir().join(format!("autofox-mux-{}", uuid::Uuid::new_v4()));
     let result = mux_streams_inner(
         None,
+        "task-webm",
         MuxRequest {
             video_url,
             audio_url,
@@ -174,6 +183,7 @@ async fn rejects_a_container_it_cannot_mux() {
     let out = std::env::temp_dir().join(format!("autofox-mux-{}", uuid::Uuid::new_v4()));
     let error = mux_streams_inner(
         None,
+        "task-mkv",
         MuxRequest {
             video_url: "https://example.test/v".to_owned(),
             audio_url: "https://example.test/a".to_owned(),
@@ -226,6 +236,7 @@ async fn cancel_kills_ffmpeg_and_removes_the_part_file() {
     let started = std::time::Instant::now();
     let error = mux_streams_inner(
         None,
+        "task-cancel",
         MuxRequest {
             video_url: format!("{base}/v.mp4"),
             audio_url: format!("{base}/a.mp4"),
@@ -264,6 +275,7 @@ async fn failed_mux_removes_the_part_file() {
     tokio::fs::write(&part, b"stale").await.expect("seed part");
     let error = mux_streams_inner(
         None,
+        "task-fail",
         MuxRequest {
             video_url: format!("{base}/v.mp4"),
             audio_url: format!("{base}/a.mp4"),
