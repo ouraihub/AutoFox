@@ -375,23 +375,29 @@ fn append_to_paths(
     first_error.map_or(Ok(()), Err)
 }
 
-/// Drops the oldest half of `path` once it exceeds [`MIRROR_MAX_BYTES`].
+/// Keeps only the newest half-cap of `path` once it exceeds [`MIRROR_MAX_BYTES`].
 ///
-/// Rewrites in place from a byte offset advanced to the next newline, so the
-/// file never starts mid-line and [`parse_file_line`] keeps working. Halving
-/// rather than emptying means a trim never costs the readable tail.
+/// Reads just the retained tail, never the whole file: releases before the cap
+/// let `autofox.log` grow without limit, so the first trim after an upgrade may
+/// meet a file far larger than memory should hold. The kept bytes start after
+/// the first newline, so the file never begins mid-line and [`parse_file_line`]
+/// keeps working; a single line longer than the window is dropped entirely.
 fn cap_mirror_file(path: &std::path::Path) -> std::io::Result<()> {
     let length = fs::metadata(path)?.len();
     if length <= MIRROR_MAX_BYTES {
         return Ok(());
     }
-    let mut text = Vec::new();
-    fs::File::open(path)?.read_to_end(&mut text)?;
-    let cut = usize::try_from(length / 2).unwrap_or(0);
+    let keep = MIRROR_MAX_BYTES / 2;
+    let mut file = fs::File::open(path)?;
+    // Starting one byte early tells us whether the window begins on a line
+    // boundary: if that byte is `\n`, the first kept line is already whole.
+    file.seek(SeekFrom::Start(length - keep - 1))?;
+    let mut text = Vec::with_capacity(usize::try_from(keep + 1).unwrap_or(0));
+    file.take(keep + 1).read_to_end(&mut text)?;
     let start = text
-        .get(cut..)
-        .and_then(|rest| rest.iter().position(|byte| *byte == b'\n'))
-        .map_or(text.len(), |offset| cut + offset + 1);
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(text.len(), |offset| offset + 1);
     fs::write(path, text.get(start..).unwrap_or_default())
 }
 
@@ -638,6 +644,46 @@ mod tests {
         assert!(text.ends_with("newest\n"), "the newest line must survive");
         // The daily file rotates by name and is never trimmed.
         assert_eq!(read_file_tail(&daily)[0].message, "newest");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A pre-cap install can carry a mirror many times the cap. The trim must
+    /// land within the cap in one pass (the old halving kept megabytes), keep
+    /// whole lines, and keep the newest one.
+    #[test]
+    fn an_oversized_legacy_mirror_is_trimmed_to_the_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "autofox-log-legacy-{}-{}",
+            std::process::id(),
+            now_utc().1.replace([':', '.'], "")
+        ));
+        fs::create_dir_all(&root).expect("create test dir");
+        let daily = root.join("2026-09-26.log");
+        let mirror = root.join("autofox.log");
+        let filler = "00:00:00.000 INFO test: legacy line padding padding\n";
+        let repeats = usize::try_from(20 * MIRROR_MAX_BYTES).unwrap_or(0) / filler.len();
+        fs::write(&mirror, filler.repeat(repeats)).expect("seed legacy mirror");
+
+        let entry = LogEntry {
+            seq: 1,
+            time: "12:34:56.789".to_owned(),
+            level: "INFO".to_owned(),
+            target: "test".to_owned(),
+            message: "newest".to_owned(),
+        };
+        append_to_paths(&entry, &daily, &mirror).expect("write both feeds");
+
+        let text = fs::read_to_string(&mirror).expect("read mirror");
+        let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
+        assert!(
+            length <= MIRROR_MAX_BYTES,
+            "one trim must reach the cap, got {length}"
+        );
+        assert!(
+            text.starts_with("00:00:00.000 INFO test:"),
+            "trim must land on a line boundary"
+        );
+        assert!(text.ends_with("newest\n"), "the newest line must survive");
         let _ = fs::remove_dir_all(root);
     }
 
