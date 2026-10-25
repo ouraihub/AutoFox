@@ -1,0 +1,234 @@
+{
+  "manifest": [
+    {
+      "sourceId": "abc",
+      "title": "Example",
+      "durationSecs": 12.5,
+      "formats": [
+        {
+          "formatId": "137",
+          "delivery": {
+            "kind": "direct",
+            "url": "https://cdn.example/v.mp4"
+          },
+          "container": "mp4",
+          "video": {
+            "codec": "avc1",
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "bitrateKbps": 4400.5
+          },
+          "audio": {
+            "codec": "mp4a",
+            "channels": 2,
+            "sampleRate": 44100,
+            "bitrateKbps": 128.0
+          },
+          "size": {
+            "kind": "exact",
+            "bytes": 1024
+          },
+          "httpHeaders": {
+            "User-Agent": "AutoFox"
+          }
+        },
+        {
+          "formatId": "hls-1",
+          "delivery": {
+            "kind": "hls",
+            "playlistUrl": "https://cdn.example/p.m3u8"
+          },
+          "container": "mp4",
+          "video": null,
+          "audio": null,
+          "size": {
+            "kind": "unknown"
+          },
+          "httpHeaders": {}
+        },
+        {
+          "formatId": "hls-1",
+          "delivery": {
+            "kind": "dash",
+            "manifestUrl": "https://cdn.example/m.mpd"
+          },
+          "container": "mp4",
+          "video": null,
+          "audio": null,
+          "size": {
+            "kind": "unknown"
+          },
+          "httpHeaders": {}
+        }
+      ],
+      "downloadOptions": [
+        {
+          "optionId": "o1",
+          "label": "1080p",
+          "container": "mp4",
+          "detail": "avc1 + mp4a",
+          "size": {
+            "kind": "approx",
+            "bytes": 2048
+          },
+          "height": 360,
+          "plan": {
+            "kind": "progressive",
+            "formatId": "18",
+            "url": "https://cdn.example/v.mp4"
+          }
+        },
+        {
+          "optionId": "o1",
+          "label": "1080p",
+          "container": "mp4",
+          "detail": "avc1 + mp4a",
+          "size": {
+            "kind": "approx",
+            "bytes": 2048
+          },
+          "height": 1080,
+          "plan": {
+            "kind": "merge",
+            "videoUrl": "https://cdn.example/v",
+            "audioUrl": "https://cdn.example/a",
+            "videoFormatId": "137",
+            "audioFormatId": "140"
+          }
+        },
+        {
+          "optionId": "o1",
+          "label": "1080p",
+          "container": "mp4",
+          "detail": "avc1 + mp4a",
+          "size": {
+            "kind": "approx",
+            "bytes": 2048
+          },
+          "height": null,
+          "plan": {
+            "kind": "manifest",
+            "formatId": "hls-1",
+            "url": "https://cdn.example/p.m3u8"
+          }
+        }
+      ],
+      "entries": [
+        {
+          "sourceId": "e1",
+          "title": "Entry",
+          "url": "https://example.com/e1",
+          "durationSecs": 3.0
+        }
+      ],
+      "producedBy": "builtin-ytdlp",
+      "backendVersion": "2026.08.19"
+    },
+    {
+      "sourceId": "abc",
+      "title": "Example",
+      "durationSecs": null,
+      "formats": [],
+      "downloadOptions": [],
+      "entries": [],
+      "producedBy": "builtin-ytdlp",
+      "backendVersion": "2026.08.19"
+    }
+  ],
+  "backendStatus": [
+    {
+      "ytdlpReady": true,
+      "ffmpegReady": true,
+      "ffprobeReady": false,
+      "version": "2026.08.19",
+      "ytdlpPath": "D:\\AutoFox\\yt-dlp.exe",
+      "ffmpegPath": "D:\\AutoFox\\lib\\ffmpeg.exe"
+    },
+    {
+      "ytdlpReady": true,
+      "ffmpegReady": false,
+      "ffprobeReady": false,
+      "version": null,
+      "ytdlpPath": "D:\\AutoFox\\yt-dlp.exe",
+      "ffmpegPath": "D:\\AutoFox\\lib\\ffmpeg.exe"
+    }
+  ],
+  "settings": [
+    {
+      "schemaVersion": 1,
+      "downloadDirectory": "D:\\Downloads",
+      "extractorPolicy": "ytdlpOnly",
+      "allowPathLookup": false,
+      "ytdlpPath": "D:\\tools\\yt-dlp.exe",
+      "ffmpegPath": "D:\\tools\\ffmpeg.exe",
+      "logLevel": "INFO"
+    },
+    {
+      "schemaVersion": 1,
+      "downloadDirectory": null,
+      "extractorPolicy": "auto",
+      "allowPathLookup": false,
+      "ytdlpPath": null,
+      "ffmpegPath": null,
+      "logLevel": "INFO"
+    }
+  ],
+  "tasks": [
+    [
+      {
+        "taskId": "t1",
+        "kind": "mux",
+        "state": "done",
+        "outputPath": "D:\\out\\a.mp4",
+        "errorKey": null
+      },
+      {
+        "taskId": "t1",
+        "kind": "mux",
+        "state": "failed",
+        "outputPath": null,
+        "errorKey": "errors.muxFailed"
+      }
+    ]
+  ],
+  "progress": [
+    {
+      "taskId": "t1",
+      "bytesWritten": 512,
+      "totalBytes": 1024,
+      "bytesPerSecond": 64,
+      "percent": 0.5
+    },
+    {
+      "taskId": "t1",
+      "bytesWritten": 512,
+      "totalBytes": null,
+      "bytesPerSecond": 64,
+      "percent": null
+    }
+  ],
+  "downloadResult": [
+    {
+      "taskId": "t1",
+      "outputPath": "D:\\out\\a.mp4",
+      "bytesWritten": 1024
+    }
+  ],
+  "muxResult": [
+    {
+      "outputPath": "D:\\out\\a.mp4"
+    }
+  ],
+  "logs": [
+    [
+      {
+        "seq": 1,
+        "time": "12:34:56.789",
+        "level": "INFO",
+        "target": "mux",
+        "message": "task t1 finished"
+      }
+    ]
+  ]
+}

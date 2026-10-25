@@ -21,6 +21,19 @@ use serde::Serialize;
 
 const TAIL_BYTES: u64 = 256 * 1024;
 
+/// Daily files kept on disk, including today's.
+///
+/// Without a cap the log directory grows for the life of the install. Fourteen
+/// days is long enough for a user to reproduce a bug and still send the file.
+const RETAINED_DAILY_FILES: usize = 14;
+
+/// Size cap for the stable `autofox.log` mirror.
+///
+/// The daily files rotate by name, but the mirror has one fixed path and would
+/// otherwise grow forever. It is a compatibility tail, so dropping the oldest
+/// half when it doubles the read window keeps it useful without unbounded size.
+const MIRROR_MAX_BYTES: u64 = 2 * TAIL_BYTES;
+
 /// A backend log level ordered from most severe to most verbose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -147,6 +160,25 @@ impl LogState {
             let seq = state.next_sequence();
             if let Ok(mut entries) = state.entries.lock() {
                 entries.push(LogEntry { seq, ..entry });
+            }
+        }
+        // Pruning runs once per process instead of per line: the directory can
+        // only gain one file per day, so there is nothing for a hot path to do.
+        match prune_daily_files(&paths::data_dir().join("logs")) {
+            Ok(0) => {}
+            Ok(removed) => {
+                state.append(
+                    LogLevel::Info,
+                    "logs",
+                    format!("pruned {removed} daily log file(s) past the {RETAINED_DAILY_FILES}-day window"),
+                );
+            }
+            Err(error) => {
+                state.append(
+                    LogLevel::Warn,
+                    "logs",
+                    format!("cannot prune old daily log files: {error}"),
+                );
             }
         }
         state
@@ -333,7 +365,65 @@ fn append_to_paths(
             first_error = Some(error);
         }
     }
+    // Only the mirror needs a size check: daily files rotate by name, so each
+    // one stops growing at midnight UTC.
+    if let Err(error) = cap_mirror_file(compatibility_path)
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Keeps only the newest half-cap of `path` once it exceeds [`MIRROR_MAX_BYTES`].
+///
+/// Reads just the retained tail, never the whole file: releases before the cap
+/// let `autofox.log` grow without limit, so the first trim after an upgrade may
+/// meet a file far larger than memory should hold. The kept bytes start after
+/// the first newline, so the file never begins mid-line and [`parse_file_line`]
+/// keeps working; a single line longer than the window is dropped entirely.
+fn cap_mirror_file(path: &std::path::Path) -> std::io::Result<()> {
+    let length = fs::metadata(path)?.len();
+    if length <= MIRROR_MAX_BYTES {
+        return Ok(());
+    }
+    let keep = MIRROR_MAX_BYTES / 2;
+    let mut file = fs::File::open(path)?;
+    // Starting one byte early tells us whether the window begins on a line
+    // boundary: if that byte is `\n`, the first kept line is already whole.
+    file.seek(SeekFrom::Start(length - keep - 1))?;
+    let mut text = Vec::with_capacity(usize::try_from(keep + 1).unwrap_or(0));
+    file.take(keep + 1).read_to_end(&mut text)?;
+    let start = text
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(text.len(), |offset| offset + 1);
+    fs::write(path, text.get(start..).unwrap_or_default())
+}
+
+/// Deletes daily files beyond the newest [`RETAINED_DAILY_FILES`].
+///
+/// Names are `YYYY-MM-DD.log`, so a lexicographic sort is chronological and no
+/// filesystem timestamp is consulted.
+fn prune_daily_files(logs_dir: &std::path::Path) -> std::io::Result<usize> {
+    let mut names: Vec<String> = fs::read_dir(logs_dir)?
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_daily_log_name(name))
+        .collect();
+    if names.len() <= RETAINED_DAILY_FILES {
+        return Ok(0);
+    }
+    names.sort_unstable();
+    let removed = names.len() - RETAINED_DAILY_FILES;
+    let mut count = 0;
+    for name in names.get(..removed).unwrap_or_default() {
+        if fs::remove_file(logs_dir.join(name)).is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn read_startup_tail() -> Vec<LogEntry> {
@@ -509,6 +599,142 @@ mod tests {
         append_to_paths(&entry, &daily, &legacy).expect("write both feeds");
         assert_eq!(read_file_tail(&daily)[0].message, "persisted");
         assert_eq!(read_file_tail(&legacy)[0].message, "persisted");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mirror_is_capped_and_keeps_whole_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "autofox-log-cap-{}-{}",
+            std::process::id(),
+            now_utc().1.replace([':', '.'], "")
+        ));
+        fs::create_dir_all(&root).expect("create test dir");
+        let daily = root.join("2026-09-26.log");
+        let mirror = root.join("autofox.log");
+        // One line is ~40 bytes, so this overshoots MIRROR_MAX_BYTES.
+        let filler = "00:00:00.000 INFO test: old line padding padding padding\n";
+        let repeats = usize::try_from(MIRROR_MAX_BYTES).unwrap_or(0) / filler.len() + 200;
+        fs::write(&mirror, filler.repeat(repeats)).expect("seed oversized mirror");
+        assert!(
+            fs::metadata(&mirror).expect("mirror exists").len() > MIRROR_MAX_BYTES,
+            "the seeded mirror must exceed the cap for this test to mean anything"
+        );
+
+        let entry = LogEntry {
+            seq: 1,
+            time: "12:34:56.789".to_owned(),
+            level: "INFO".to_owned(),
+            target: "test".to_owned(),
+            message: "newest".to_owned(),
+        };
+        append_to_paths(&entry, &daily, &mirror).expect("write both feeds");
+
+        let length = fs::metadata(&mirror).expect("mirror exists").len();
+        assert!(
+            length <= MIRROR_MAX_BYTES,
+            "mirror should be trimmed to the cap, got {length}"
+        );
+        let text = fs::read_to_string(&mirror).expect("read mirror");
+        assert!(
+            text.starts_with("00:00:00.000 INFO test:"),
+            "trim must land on a line boundary, got {:?}",
+            text.chars().take(30).collect::<String>()
+        );
+        assert!(text.ends_with("newest\n"), "the newest line must survive");
+        // The daily file rotates by name and is never trimmed.
+        assert_eq!(read_file_tail(&daily)[0].message, "newest");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A pre-cap install can carry a mirror many times the cap. The trim must
+    /// land within the cap in one pass (the old halving kept megabytes), keep
+    /// whole lines, and keep the newest one.
+    #[test]
+    fn an_oversized_legacy_mirror_is_trimmed_to_the_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "autofox-log-legacy-{}-{}",
+            std::process::id(),
+            now_utc().1.replace([':', '.'], "")
+        ));
+        fs::create_dir_all(&root).expect("create test dir");
+        let daily = root.join("2026-09-26.log");
+        let mirror = root.join("autofox.log");
+        let filler = "00:00:00.000 INFO test: legacy line padding padding\n";
+        let repeats = usize::try_from(20 * MIRROR_MAX_BYTES).unwrap_or(0) / filler.len();
+        fs::write(&mirror, filler.repeat(repeats)).expect("seed legacy mirror");
+
+        let entry = LogEntry {
+            seq: 1,
+            time: "12:34:56.789".to_owned(),
+            level: "INFO".to_owned(),
+            target: "test".to_owned(),
+            message: "newest".to_owned(),
+        };
+        append_to_paths(&entry, &daily, &mirror).expect("write both feeds");
+
+        let text = fs::read_to_string(&mirror).expect("read mirror");
+        let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
+        assert!(
+            length <= MIRROR_MAX_BYTES,
+            "one trim must reach the cap, got {length}"
+        );
+        assert!(
+            text.starts_with("00:00:00.000 INFO test:"),
+            "trim must land on a line boundary"
+        );
+        assert!(text.ends_with("newest\n"), "the newest line must survive");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_daily_files_only() {
+        let root = std::env::temp_dir().join(format!(
+            "autofox-log-prune-{}-{}",
+            std::process::id(),
+            now_utc().1.replace([':', '.'], "")
+        ));
+        fs::create_dir_all(&root).expect("create test dir");
+        for day in 1..=(RETAINED_DAILY_FILES + 3) {
+            let name = format!("2026-09-{day:02}.log");
+            fs::write(root.join(&name), "00:00:00.000 INFO t: x\n").expect("seed daily file");
+        }
+        // Neither the mirror nor an unrelated file may be touched.
+        fs::write(root.join("autofox.log"), "mirror\n").expect("seed mirror");
+        fs::write(root.join("notes.txt"), "keep\n").expect("seed unrelated file");
+
+        let removed = prune_daily_files(&root).expect("prune succeeds");
+        assert_eq!(removed, 3);
+
+        let mut left: Vec<String> = fs::read_dir(&root)
+            .expect("read dir")
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| is_daily_log_name(name))
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left.len(), RETAINED_DAILY_FILES);
+        assert_eq!(left.first().map(String::as_str), Some("2026-09-04.log"));
+        assert!(root.join("autofox.log").is_file(), "mirror must survive");
+        assert!(
+            root.join("notes.txt").is_file(),
+            "unrelated file must survive"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pruning_is_a_no_op_below_the_window() {
+        let root = std::env::temp_dir().join(format!(
+            "autofox-log-prune-noop-{}-{}",
+            std::process::id(),
+            now_utc().1.replace([':', '.'], "")
+        ));
+        fs::create_dir_all(&root).expect("create test dir");
+        for day in 1..=3 {
+            fs::write(root.join(format!("2026-09-{day:02}.log")), "x\n").expect("seed");
+        }
+        assert_eq!(prune_daily_files(&root).expect("prune succeeds"), 0);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,7 +1,6 @@
 //! Lock-discipline and concurrency-limit tests for [`TaskRegistry`].
 
 use super::{MAX_ACTIVE_TASKS, TaskRegistry, TaskState};
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -58,10 +57,7 @@ fn register_marks_the_task_downloading() {
     assert_eq!(listed[0].kind, "direct");
     assert_eq!(listed[0].state, TaskState::Downloading);
     assert!(listed[0].output_path.is_none(), "no output path yet");
-    assert!(
-        !cancel.load(Ordering::Relaxed),
-        "a fresh task is not cancelled"
-    );
+    assert!(!cancel.is_stopped(), "a fresh task is not cancelled");
 }
 
 #[test]
@@ -139,4 +135,142 @@ fn a_paused_task_does_not_hold_a_slot_open_forever() {
         .expect("the paused task stays listed")
         .state;
     assert_eq!(state, TaskState::Paused);
+}
+
+#[test]
+fn a_late_completion_does_not_overwrite_a_cancel() {
+    // The ffmpeg mux path keeps running after `cancel` sets the flag, so its
+    // `finish(Done)` lands afterwards. Before the guard this flipped the UI
+    // from 已取消 back to 已完成 and the user's decision was lost.
+    let registry = TaskRegistry::default();
+    let (task_id, cancel) = registry.register("stream").expect("first task registers");
+    registry
+        .cancel(&task_id, false)
+        .expect("an active task can be cancelled");
+    assert!(cancel.is_stopped(), "cancel flag should be set");
+
+    registry.finish(
+        &task_id,
+        TaskState::Done,
+        Some("D:\\out\\clip.mp4".to_owned()),
+        None,
+    );
+
+    let summary = registry
+        .list()
+        .into_iter()
+        .find(|s| s.task_id == task_id)
+        .expect("the cancelled task stays listed");
+    assert_eq!(summary.state, TaskState::Cancelled);
+    assert_eq!(
+        summary.output_path, None,
+        "a cancelled task must not gain an output path"
+    );
+}
+
+#[test]
+fn a_late_failure_does_not_overwrite_a_pause() {
+    // Pause cancels the in-flight HTTP stream, so the worker reports an error
+    // right after. Recording it would strand the task in `Failed` and make the
+    // retained `.part` file unresumable.
+    let registry = TaskRegistry::default();
+    let (task_id, _) = registry.register("direct").expect("first task registers");
+    registry
+        .cancel(&task_id, true)
+        .expect("an active task can be paused");
+
+    registry.finish(
+        &task_id,
+        TaskState::Failed,
+        None,
+        Some("errors.network".to_owned()),
+    );
+
+    let summary = registry
+        .list()
+        .into_iter()
+        .find(|s| s.task_id == task_id)
+        .expect("the paused task stays listed");
+    assert_eq!(summary.state, TaskState::Paused);
+    assert_eq!(
+        summary.error_key, None,
+        "pausing is not a failure and must not record an error key"
+    );
+}
+
+#[test]
+fn finish_still_records_the_first_terminal_result() {
+    // The guard must not block the ordinary path: a task that is still
+    // downloading accepts exactly one terminal transition, and a second one is
+    // then refused.
+    let registry = TaskRegistry::default();
+    let (task_id, _) = registry.register("direct").expect("first task registers");
+    registry.finish(
+        &task_id,
+        TaskState::Done,
+        Some("D:\\out\\first.mp4".to_owned()),
+        None,
+    );
+    registry.finish(
+        &task_id,
+        TaskState::Failed,
+        None,
+        Some("errors.network".to_owned()),
+    );
+
+    let summary = registry
+        .list()
+        .into_iter()
+        .find(|s| s.task_id == task_id)
+        .expect("the finished task stays listed");
+    assert_eq!(summary.state, TaskState::Done);
+    assert_eq!(summary.output_path.as_deref(), Some("D:\\out\\first.mp4"));
+    assert_eq!(summary.error_key, None);
+}
+
+/// Cancel first: the worker's later publish claim must lose, so a file is
+/// never published for a task the registry reports as cancelled.
+#[test]
+fn a_cancel_before_publish_blocks_the_publish() {
+    let registry = TaskRegistry::default();
+    let (task_id, signal) = registry.register("mux").expect("task registers");
+    registry
+        .cancel(&task_id, false)
+        .expect("running task cancels");
+    assert!(
+        !signal.claim_publish(),
+        "publish must lose to an earlier cancel"
+    );
+}
+
+/// Publish first: a cancel that arrives while the output is being renamed is
+/// rejected and leaves the task running, so `finish(Done)` still lands.
+#[test]
+fn a_cancel_after_publish_is_rejected() {
+    let registry = TaskRegistry::default();
+    let (task_id, signal) = registry.register("mux").expect("task registers");
+    assert!(signal.claim_publish(), "an untouched task may publish");
+
+    let error = registry
+        .cancel(&task_id, false)
+        .expect_err("cancel must not win once publishing started");
+    assert_eq!(error.message_key, "errors.taskFinishing");
+    assert!(
+        !signal.is_stopped(),
+        "the rejected cancel must not stop the worker"
+    );
+
+    registry.finish(
+        &task_id,
+        TaskState::Done,
+        Some("D:\\out\\a.mp4".to_owned()),
+        None,
+    );
+    let state = registry
+        .list()
+        .into_iter()
+        .find(|s| s.task_id == task_id)
+        .expect("listed")
+        .state;
+    assert_eq!(state, TaskState::Done);
 }

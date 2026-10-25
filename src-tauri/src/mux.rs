@@ -4,7 +4,12 @@
 #[path = "mux_tests.rs"]
 mod mux_tests;
 
-use std::{path::PathBuf, process::Stdio};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
+
+use crate::queue::TaskSignal;
 
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -64,36 +69,45 @@ pub async fn download_stream(
     state: tauri::State<'_, crate::queue::TaskRegistry>,
     request: StreamRequest,
 ) -> Result<MuxResult, IpcError> {
-    let (task_id, _cancel) = state.start("stream", Some(&app))?;
+    let (task_id, cancel) = state.start("stream", Some(&app))?;
     logs::info(
         TARGET,
         format!("stream task {task_id}: {}", logs::redact_url(&request.url)),
     );
-    let result = download_stream_inner(Some(&app), request).await;
-    match &result {
+    let result = download_stream_inner(Some(&app), &task_id, request, &cancel).await;
+    record_outcome(&state, &task_id, &result);
+    result
+}
+
+/// Moves a stream/mux task terminal: user cancel is `Cancelled` and a warn,
+/// anything else `Failed` and an error, same mapping as `download.rs`.
+fn record_outcome(
+    state: &crate::queue::TaskRegistry,
+    task_id: &str,
+    result: &Result<MuxResult, IpcError>,
+) {
+    use crate::queue::TaskState;
+    match result {
         Ok(value) => {
-            logs::info(TARGET, format!("stream task {task_id} finished"));
+            logs::info(TARGET, format!("task {task_id} finished"));
             state.finish(
-                &task_id,
-                crate::queue::TaskState::Done,
+                task_id,
+                TaskState::Done,
                 Some(value.output_path.clone()),
                 None,
             );
         }
         Err(error) => {
-            logs::error(
-                TARGET,
-                format!("stream task {task_id} failed: {}", error.detail),
-            );
-            state.finish(
-                &task_id,
-                crate::queue::TaskState::Failed,
-                None,
-                Some(error.message_key.to_owned()),
-            );
+            let terminal = if error.code == ErrorCode::Cancelled {
+                logs::warn(TARGET, format!("task {task_id} cancelled"));
+                TaskState::Cancelled
+            } else {
+                logs::error(TARGET, format!("task {task_id} failed: {}", error.detail));
+                TaskState::Failed
+            };
+            state.finish(task_id, terminal, None, Some(error.message_key.to_owned()));
         }
     }
-    result
 }
 
 /// One manifest stream passed to ffmpeg.
@@ -114,7 +128,9 @@ pub struct StreamRequest {
 
 async fn download_stream_inner(
     app: Option<&tauri::AppHandle>,
+    task_id: &str,
     request: StreamRequest,
+    cancel: &TaskSignal,
 ) -> Result<MuxResult, IpcError> {
     let input = validate_http_url(&request.url, "url")?;
     let duration_secs = request.duration_secs;
@@ -134,7 +150,9 @@ async fn download_stream_inner(
         .map_err(|error| io_error(error.to_string()))?;
     let name = sanitize_file_name(&request.file_name);
     let final_path = output_dir.join(format!("{name}.mp4"));
-    let temp_path = output_dir.join(format!("{name}.mp4.part"));
+    // Owned by this task: two jobs with the same output name must not share a
+    // `.part`, or one job's cleanup would delete the other's in-flight bytes.
+    let temp_path = output_dir.join(format!("{name}.{task_id}.mp4.part"));
     let mut command = Command::new(ffmpeg);
     command.args([
         "-hide_banner",
@@ -163,13 +181,15 @@ async fn download_stream_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_with_progress(command, "mux", duration_secs, |event| {
+    let output = run_with_progress(command, task_id, duration_secs, cancel, |event| {
         if let Some(app) = app {
             let _ = tauri::Emitter::emit(app, "task://progress", event);
         }
     })
-    .await?;
+    .await
+    .inspect_err(|_| discard_partial(&temp_path))?;
     if !output.status.success() {
+        discard_partial(&temp_path);
         return Err(IpcError {
             code: ErrorCode::MuxFailed,
             message_key: "errors.muxFailed",
@@ -178,9 +198,7 @@ async fn download_stream_inner(
             detail: "ffmpeg could not download the stream".to_owned(),
         });
     }
-    fs::rename(&temp_path, &final_path)
-        .await
-        .map_err(|error| io_error(error.to_string()))?;
+    publish(cancel, &temp_path, &final_path).await?;
     Ok(MuxResult {
         output_path: final_path.to_string_lossy().into_owned(),
     })
@@ -203,9 +221,13 @@ async fn run_with_progress(
     mut command: Command,
     task_id: &str,
     duration_secs: Option<f64>,
+    cancel: &TaskSignal,
     mut sink: impl FnMut(crate::download::DownloadProgress),
 ) -> Result<std::process::Output, IpcError> {
+    // Every early return below (timeout, pipe error, cancel) drops `child`;
+    // without this the ffmpeg process outlives the task and keeps writing.
     let mut child = command
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| internal(error.to_string()))?;
     let stdout = child
@@ -267,13 +289,36 @@ async fn run_with_progress(
         Ok::<(), IpcError>(())
     };
 
-    timeout(MUX_TIMEOUT, pump)
-        .await
-        .map_err(|_| timed_out())??;
-    let status = timeout(MUX_TIMEOUT, child.wait())
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|error| internal(error.to_string()))?;
+    // The pump only wakes on ffmpeg output, so cancellation cannot be checked
+    // inside the loop alone: a stalled CDN read would ignore the flag until the
+    // 30-minute timeout. Polling in parallel bounds the reaction to 200ms, and
+    // the watch races the whole run, including `wait` after the pipes close.
+    let watch = async {
+        while !cancel.is_stopped() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    let run = async {
+        pump.await?;
+        child
+            .wait()
+            .await
+            .map_err(|error| internal(error.to_string()))
+    };
+    let finished = tokio::select! {
+        result = timeout(MUX_TIMEOUT, run) => result.unwrap_or_else(|_| Err(timed_out())),
+        () = watch => Err(cancelled()),
+    };
+    let status = match finished {
+        Ok(status) => status,
+        Err(error) => {
+            // ffmpeg ignores a closed stdout, so it must be killed on every
+            // early exit. Awaiting the kill also reaps it, which releases the
+            // Windows file lock before the caller deletes the `.part`.
+            let _ = child.kill().await;
+            return Err(error);
+        }
+    };
     let stderr = stderr_task.await.unwrap_or_default();
     Ok(std::process::Output {
         status,
@@ -286,27 +331,31 @@ async fn run_with_progress(
 #[tauri::command]
 pub async fn mux_streams(
     app: tauri::AppHandle,
+    state: tauri::State<'_, crate::queue::TaskRegistry>,
     request: MuxRequest,
 ) -> Result<MuxResult, IpcError> {
+    let (task_id, cancel) = state.start("mux", Some(&app))?;
     logs::info(
         TARGET,
         format!(
-            "muxing video {} with audio {}",
+            "mux task {task_id}: video {} with audio {}",
             logs::redact_url(&request.video_url),
             logs::redact_url(&request.audio_url)
         ),
     );
-    mux_streams_inner(Some(&app), request, |event| {
+    let result = mux_streams_inner(Some(&app), &task_id, request, &cancel, |event| {
         let _ = tauri::Emitter::emit(&app, "task://progress", event);
     })
-    .await
-    .inspect(|_| logs::info(TARGET, "mux finished"))
-    .inspect_err(|error| logs::error(TARGET, format!("mux failed: {}", error.detail)))
+    .await;
+    record_outcome(&state, &task_id, &result);
+    result
 }
 
 async fn mux_streams_inner(
     app: Option<&tauri::AppHandle>,
+    task_id: &str,
     request: MuxRequest,
+    cancel: &TaskSignal,
     sink: impl FnMut(crate::download::DownloadProgress),
 ) -> Result<MuxResult, IpcError> {
     let video = validate_http_url(&request.video_url, "videoUrl")?;
@@ -342,7 +391,8 @@ async fn mux_streams_inner(
         }
     };
     let final_path = output_dir.join(format!("{name}.{container}"));
-    let temp_path = output_dir.join(format!("{name}.{container}.part"));
+    // Per-task temp name; see `download_stream_inner`.
+    let temp_path = output_dir.join(format!("{name}.{task_id}.{container}.part"));
     // googlevideo rejects the CDN URLs with 403 unless the request repeats the
     // User-Agent the extractor used, so `-headers` must precede each `-i`: in
     // ffmpeg it is a per-input option, not a global one.
@@ -381,8 +431,11 @@ async fn mux_streams_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_with_progress(command, "mux", request.duration_secs, sink).await?;
+    let output = run_with_progress(command, task_id, request.duration_secs, cancel, sink)
+        .await
+        .inspect_err(|_| discard_partial(&temp_path))?;
     if !output.status.success() {
+        discard_partial(&temp_path);
         // ffmpeg's own diagnosis is the only way to tell a dead CDN URL from a
         // codec the container rejects, and it never contains the signed query.
         logs::error(
@@ -404,9 +457,7 @@ async fn mux_streams_inner(
             detail: "ffmpeg could not combine the selected streams".to_owned(),
         });
     }
-    fs::rename(&temp_path, &final_path)
-        .await
-        .map_err(|error| io_error(error.to_string()))?;
+    publish(cancel, &temp_path, &final_path).await?;
     if let Some(app) = app {
         let _ = tauri::Emitter::emit(
             app,
@@ -490,6 +541,46 @@ fn io_error(detail: String) -> IpcError {
         field: None,
         retryable: true,
         detail,
+    }
+}
+
+/// Moves the finished `.part` into place, unless the user stopped the task.
+///
+/// `claim_publish` and the registry's `stop` are one atomic transition, so a
+/// cancel either lands first (the output is discarded, never published) or is
+/// rejected because the rename has already been claimed. Checking the flag
+/// and then renaming would leave a window where both happen.
+async fn publish(cancel: &TaskSignal, temp_path: &Path, final_path: &Path) -> Result<(), IpcError> {
+    if !cancel.claim_publish() {
+        discard_partial(temp_path);
+        return Err(cancelled());
+    }
+    fs::rename(temp_path, final_path)
+        .await
+        .map_err(|error| io_error(error.to_string()))
+        .inspect_err(|_| discard_partial(temp_path))
+}
+
+/// Removes the `.part` file a failed or cancelled ffmpeg left behind.
+///
+/// A `-c copy` output cut mid-write has no trailing index, so it is neither
+/// playable nor resumable, and nothing reads it after the task ends.
+fn discard_partial(temp_path: &Path) {
+    match std::fs::remove_file(temp_path) {
+        Ok(()) => logs::info(TARGET, "discarded incomplete output"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => logs::warn(TARGET, format!("cannot remove incomplete output: {error}")),
+    }
+}
+/// Matches `download.rs`: cancellation is a distinct code so the queue can move
+/// the task to `Cancelled` instead of `Failed`.
+fn cancelled() -> IpcError {
+    IpcError {
+        code: ErrorCode::Cancelled,
+        message_key: "errors.cancelled",
+        field: None,
+        retryable: false,
+        detail: "mux cancelled".to_owned(),
     }
 }
 fn timed_out() -> IpcError {

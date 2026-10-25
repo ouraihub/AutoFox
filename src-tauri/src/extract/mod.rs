@@ -221,11 +221,29 @@ pub async fn get_backend_status(
     .await
 }
 
+/// The bundled yt-dlp process, as an [`backend::Extractor`].
+///
+/// Owns the settings snapshot it needs so that `probe` takes only a URL: that
+/// is what keeps [`backend::probe_with_fallback`] free of any knowledge about
+/// executables and paths.
+struct YtDlpExtractor {
+    settings: crate::settings::Settings,
+}
+
+impl backend::Extractor for YtDlpExtractor {
+    fn id(&self) -> backend::BackendId {
+        backend::PROCESS_YTDLP
+    }
+
+    fn probe<'a>(&'a self, url: &'a Url) -> backend::ProbeFuture<'a> {
+        Box::pin(probe_via_ytdlp(&self.settings, url))
+    }
+}
+
 /// Resolves the backend chain for the configured policy and probes one URL.
 ///
-/// Only one backend is registered today, so this reads as a thin wrapper. It
-/// is not: it is the seam that makes `extractorPolicy` load-bearing, and until
-/// it existed the settings dropdown silently did nothing.
+/// The chain is what makes `extractorPolicy` load-bearing: until it existed the
+/// settings dropdown silently did nothing.
 #[tauri::command]
 pub async fn probe_url(
     state: tauri::State<'_, crate::settings::SettingsState>,
@@ -261,11 +279,9 @@ pub async fn probe_url(
         });
     }
 
-    logs::debug(
-        TARGET,
-        format!("candidate backend {}", backend::PROCESS_YTDLP),
-    );
-    probe_via_ytdlp(&settings, &url).await
+    let ytdlp = YtDlpExtractor { settings };
+    let candidates: [&dyn backend::Extractor; 1] = [&ytdlp];
+    backend::probe_with_fallback(&candidates, &url).await
 }
 
 /// Probes one URL with the bundled or configured yt-dlp executable.
@@ -302,6 +318,8 @@ async fn probe_via_ytdlp(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // `timeout` drops the future on expiry; this reaps yt-dlp with it.
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -350,7 +368,10 @@ async fn probe_via_ytdlp(
 async fn detect_version(executable: &Path) -> Option<String> {
     let output = timeout(
         VERSION_TIMEOUT,
-        Command::new(executable).arg("--version").output(),
+        Command::new(executable)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()?

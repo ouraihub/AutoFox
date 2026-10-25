@@ -1,11 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Download, FolderOpen, Activity } from '@lucide/svelte';
-  import { Button, Input, Badge, Progress, Empty, Tabs, LogBar, type TabItem } from '$lib/components/ui';
+  import { Button, Input, Tabs, LogBar, type TabItem } from '$lib/components/ui';
+  import DownloadPanel from '$lib/components/panels/download-panel.svelte';
+  import TaskPanel from '$lib/components/panels/task-panel.svelte';
+  import BackendPanel from '$lib/components/panels/backend-panel.svelte';
   import { downloadDir } from '@tauri-apps/api/path';
   import { open } from '@tauri-apps/plugin-dialog';
   import { listen } from '@tauri-apps/api/event';
-  import { cancelTask, downloadDirect, downloadStream, errorMessage, getBackendStatus, getSettings, isDesktop, listTasks, muxStreams, probeUrl, saveSettings, type BackendStatus, type DownloadOption, type MediaManifest, type Settings, type SizeHint, type TaskProgress, type TaskSummary } from '$lib/ipc/client';
+  import { cancelTask, downloadDirect, downloadStream, errorMessage, getBackendStatus, getSettings, isDesktop, listTasks, muxStreams, probeUrl, saveSettings, type BackendStatus, type DownloadOption, type MediaManifest, type Settings, type TaskProgress, type TaskSummary } from '$lib/ipc/client';
+  import { parseTaskProgress } from '$lib/ipc/contract';
 
   let url = $state('');
   let backend = $state<BackendStatus | null>(null);
@@ -15,12 +19,6 @@
   let selectedOption = $state<DownloadOption | null>(null);
   let progress = $state<TaskProgress | null>(null);
   let notice = $state('');
-  // The muxer reports `percent` without a byte total and the download path
-  // reports both, so a single derived value keeps the bar on one code path.
-  const progressPercent = $derived(
-    progress?.percent ??
-      (progress?.totalBytes ? progress.bytesWritten / progress.totalBytes : null),
-  );
   let tasks = $state<TaskSummary[]>([]);
   let settings = $state<Settings>({ schemaVersion: 1, extractorPolicy: 'auto', allowPathLookup: false, logLevel: 'INFO' });
   let activeTab = $state('download');
@@ -39,15 +37,40 @@
     // desktop runtime. Unguarded it aborts this whole mount callback, so the
     // browser preview loses the task list and every later effect in the flush.
     if (!isDesktop) return;
-    let unlisten: (() => void) | undefined;
-    listen<TaskProgress>('task://progress', (event) => {
-      progress = event.payload;
-    }).then((dispose) => { unlisten = dispose; });
+    // `listen` resolves asynchronously. Without the `disposed` latch an unmount
+    // that beats the first resolve leaves the disposer unrecorded, the cleanup
+    // no-ops, and the listener outlives the component.
+    let disposed = false;
+    const disposers: Array<() => void> = [];
+    const track = (dispose: () => void) => {
+      if (disposed) dispose();
+      else disposers.push(dispose);
+    };
+    listen<unknown>('task://progress', (event) => {
+      // Events bypass `invoke`, so this is their only contract check. A bad
+      // payload is dropped and the bar keeps its last valid value.
+      try {
+        progress = parseTaskProgress(event.payload);
+      } catch (error) {
+        console.warn('ignored invalid task://progress payload', error);
+      }
+    })
+      .then(track)
+      .catch(() => { /* backend not ready */ });
+    // The backend marks tasks terminal through `task://state`. Without this the
+    // queue kept showing `downloading` until the user hit refresh by hand.
+    listen('task://state', () => { void refreshTasks(); })
+      .then(track)
+      .catch(() => { /* backend not ready */ });
     listTasks().then((items) => { tasks = items; }).catch(() => { /* backend not ready */ });
     // Settings now live in a tab rather than behind a dialog, so they load with
     // the page instead of on a click.
     getSettings().then((value) => { settings = value; }).catch(() => { /* backend not ready */ });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      for (const dispose of disposers) dispose();
+      disposers.length = 0;
+    };
   });
 
   async function checkBackend() {
@@ -140,21 +163,17 @@
     try { tasks = await listTasks(); } catch { /* browser preview */ }
   }
 
-  async function cancelCurrentTask() {
-    const current = tasks.find((task) => task.state === 'downloading');
-    if (!current) return;
-    await cancelTask(current.taskId);
+  // Takes the row's own id. `cancelCurrentTask` used to cancel "the first
+  // downloading task", which stopped the wrong one whenever two ran at once,
+  // and the limit is four.
+  async function cancelTaskById(taskId: string) {
+    try {
+      await cancelTask(taskId);
+    } catch (error) {
+      notice = errorMessage(error, '取消失败，请重试。');
+    }
     await refreshTasks();
   }
-
-  function formatSize(size: SizeHint) {
-    if (size.kind === 'unknown') return '未知';
-    const units = ['B', 'KB', 'MB', 'GB']; let value = size.bytes; let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-    return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
-  }
-
-  function formatSpeed(bytes: number) { return `${formatSize({ kind: 'exact', bytes })}/s`; }
 
   async function persistSettings() {
     try { await saveSettings(settings); notice = '设置已保存。'; } catch (error) { notice = errorMessage(error, '设置保存失败。'); }
@@ -203,84 +222,17 @@
     <Tabs items={tabs} bind:value={activeTab}>
       {#snippet panel(id)}
         {#if id === 'download'}
-          {#if manifest}
-            <div class="panel-heading">
-              <h2>{manifest.title}</h2>
-              <span class="meta">{manifest.producedBy} · {manifest.backendVersion} · {manifest.downloadOptions.length} 个可选画质</span>
-            </div>
-            {#if progress}
-              <div class="progress-card">
-                <div class="progress-line">
-                  <span>{progressPercent === null ? formatSize({ kind: 'exact', bytes: progress.bytesWritten }) : `${Math.round(progressPercent * 100)}%`}</span>
-                  <span>{formatSpeed(progress.bytesPerSecond)}</span>
-                </div>
-                <!-- With no percent the total is unknown, so the bar would read
-                     value == max and look finished. Keep it at zero and let the
-                     byte counter carry the signal instead. -->
-                <Progress value={progressPercent ?? 0} max={1} label="下载进度" />
-              </div>
-            {/if}
-            <div class="rows">
-              {#each manifest.downloadOptions as option (option.optionId)}
-                <article class="row">
-                  <div><strong>{option.label}</strong><small>{option.detail}</small></div>
-                  <div class="row-meta">
-                    <Badge variant="outline">{option.container.toUpperCase()}</Badge>
-                    <span class="size">{formatSize(option.size)}</span>
-                    <Button onclick={() => startDownload(option)} disabled={probing || downloading}>{downloading && selectedOption?.optionId === option.optionId ? '下载中…' : '下载'}</Button>
-                  </div>
-                </article>
-              {/each}
-            </div>
-            <details class="advanced">
-              <summary>全部原始格式（{manifest.formats.length}）</summary>
-              <div class="rows">
-                {#each manifest.formats as format (format.formatId)}
-                  <article class="row">
-                    <div><strong>{format.formatId}</strong><small>{format.container} · {format.delivery.kind}{format.video?.width ? ` · ${format.video.width}×${format.video.height}` : ''}</small></div>
-                    <div class="row-meta">
-                      <Badge variant="outline">{format.video?.codec ?? format.audio?.codec ?? '无媒体轨'}</Badge>
-                      <span class="size">{formatSize(format.size)}</span>
-                    </div>
-                  </article>
-                {/each}
-              </div>
-            </details>
-          {:else}
-            <Empty title="还没有解析结果" description="在上方粘贴链接并点击开始解析，可用格式会列在这里。" />
-          {/if}
+          <DownloadPanel
+            {manifest}
+            {progress}
+            busy={probing || downloading}
+            activeOptionId={selectedOption?.optionId}
+            onDownload={startDownload}
+          />
         {:else if id === 'tasks'}
-          <div class="panel-heading">
-            <h2>任务</h2>
-            <Button variant="outline" onclick={refreshTasks}>刷新</Button>
-          </div>
-          {#if tasks.length === 0}
-            <Empty title="还没有下载任务" description="解析链接后选择一个格式开始下载。" />
-          {:else}
-            <div class="rows">
-              {#each tasks as task (task.taskId)}
-                <div class="row">
-                  <div><strong>{task.kind}</strong><small>{task.state}{task.outputPath ? ` · ${task.outputPath}` : ''}</small></div>
-                  {#if task.state === 'downloading'}<Button variant="destructive" onclick={cancelCurrentTask}>取消</Button>{/if}
-                </div>
-              {/each}
-            </div>
-          {/if}
+          <TaskPanel {tasks} onRefresh={refreshTasks} onCancel={cancelTaskById} />
         {:else if id === 'backend'}
-          <div class="panel-heading">
-            <h2>解析后端</h2>
-            <Button variant="outline" onclick={checkBackend} disabled={probing}>{probing ? '检测中…' : '重新检测'}</Button>
-          </div>
-          <div class="rows">
-            <div class="row">
-              <div class="named"><span class:ready={backend?.ytdlpReady} class="backend-dot"></span><div><strong>yt-dlp</strong><small>随包 · 同目录 yt-dlp.exe</small></div></div>
-              <Badge variant={backend?.ytdlpReady ? 'default' : 'outline'}>{backend?.ytdlpReady ? backend.version ?? '就绪' : '未检测'}</Badge>
-            </div>
-            <div class="row">
-              <div class="named"><span class:ready={backend?.ffmpegReady} class="backend-dot"></span><div><strong>ffmpeg</strong><small>随包 · lib/ffmpeg.exe</small></div></div>
-              <Badge variant={backend?.ffmpegReady ? 'default' : 'outline'}>{backend?.ffmpegReady ? '就绪' : '未检测'}</Badge>
-            </div>
-          </div>
+          <BackendPanel {backend} busy={probing} onRecheck={checkBackend} />
         {:else if id === 'settings'}
           <div class="panel-heading"><h2>设置</h2></div>
           <div class="fields">
@@ -350,9 +302,7 @@
   .brand span { display: block; margin-top: .1rem; color: var(--muted-foreground); font-size: .68rem; }
   .logo { width: 2.25rem; height: 2.25rem; object-fit: contain; border-radius: .5rem; }
   .status-pill { display: flex; align-items: center; gap: .4rem; min-height: 2.25rem; padding: .38rem .7rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted-foreground); font-size: .72rem; }
-  .status-dot, .backend-dot { width: .45rem; height: .45rem; border-radius: 50%; background: var(--muted-foreground); }
-  .status-dot { background: var(--success); }
-  .backend-dot.ready { background: var(--success); }
+  .status-dot { width: .45rem; height: .45rem; border-radius: 50%; background: var(--success); }
 
   /* The URL bar is the app's primary action, so it sits above the tabs and
      stays reachable from every panel. */
@@ -369,18 +319,6 @@
   .rows { display: grid; }
   .row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); min-height: 3.25rem; padding: .7rem 0; border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; }
   .row strong { display: block; font-size: .82rem; }
-  .row small { display: block; color: var(--muted-foreground); font-size: .7rem; }
-  .row-meta { display: flex; align-items: center; gap: var(--space-sm); }
-  .size { color: var(--muted-foreground); font-size: .72rem; font-variant-numeric: tabular-nums; }
-  .named { display: flex; align-items: center; gap: .65rem; }
-
-  .advanced { margin-top: var(--space-md); border-top: 1px solid var(--border); }
-  .advanced summary { padding: .7rem 0; color: var(--muted-foreground); cursor: pointer; font-size: .72rem; }
-  .advanced summary:hover { color: var(--foreground); }
-  .advanced summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-
-  .progress-card { padding: var(--space-sm) 0 var(--space-md); }
-  .progress-line { display: flex; justify-content: space-between; margin-bottom: .4rem; font-family: var(--font-mono); font-size: .72rem; font-variant-numeric: tabular-nums; }
 
   .fields { display: grid; gap: var(--space-sm); max-width: 34rem; margin-bottom: var(--space-md); }
   .fields label { display: grid; gap: .3rem; font-size: .75rem; font-weight: 650; }

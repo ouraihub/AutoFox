@@ -1,6 +1,8 @@
 packages:
   - "."
 
+allowBuilds:
+  esbuild: false
 cargo:
   enabled: true
 

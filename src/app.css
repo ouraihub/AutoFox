@@ -136,3 +136,17 @@ button { cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 1ms !important; animation-duration: 1ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
 }
+
+/* Panel primitives shared by the download, task, backend and about panels.
+   They live here rather than in one component because Svelte scopes styles per
+   component: three panels rendering `.row` cannot each own the rule. */
+.panel-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); margin-bottom: var(--space-sm); }
+.panel-heading h2 { margin: 0; font-family: var(--font-display); font-size: 1rem; font-weight: 700; letter-spacing: -.02em; }
+.meta { color: var(--muted-foreground); font-size: .72rem; font-variant-numeric: tabular-nums; }
+.rows { display: grid; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); min-height: 3.25rem; padding: .7rem 0; border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+.row strong { display: block; font-size: .82rem; }
+.row small { display: block; color: var(--muted-foreground); font-size: .7rem; }
+.row-meta { display: flex; align-items: center; gap: var(--space-sm); }
+.size { color: var(--muted-foreground); font-size: .72rem; font-variant-numeric: tabular-nums; }
+.named { display: flex; align-items: center; gap: .65rem; }
