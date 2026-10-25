@@ -9,6 +9,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { listen } from '@tauri-apps/api/event';
   import { cancelTask, downloadDirect, downloadStream, errorMessage, getBackendStatus, getSettings, isDesktop, listTasks, muxStreams, probeUrl, saveSettings, type BackendStatus, type DownloadOption, type MediaManifest, type Settings, type TaskProgress, type TaskSummary } from '$lib/ipc/client';
+  import { parseTaskProgress } from '$lib/ipc/contract';
 
   let url = $state('');
   let backend = $state<BackendStatus | null>(null);
@@ -45,8 +46,14 @@
       if (disposed) dispose();
       else disposers.push(dispose);
     };
-    listen<TaskProgress>('task://progress', (event) => {
-      progress = event.payload;
+    listen<unknown>('task://progress', (event) => {
+      // Events bypass `invoke`, so this is their only contract check. A bad
+      // payload is dropped and the bar keeps its last valid value.
+      try {
+        progress = parseTaskProgress(event.payload);
+      } catch (error) {
+        console.warn('ignored invalid task://progress payload', error);
+      }
     })
       .then(track)
       .catch(() => { /* backend not ready */ });
