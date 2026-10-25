@@ -150,7 +150,9 @@ async fn download_stream_inner(
         .map_err(|error| io_error(error.to_string()))?;
     let name = sanitize_file_name(&request.file_name);
     let final_path = output_dir.join(format!("{name}.mp4"));
-    let temp_path = output_dir.join(format!("{name}.mp4.part"));
+    // Owned by this task: two jobs with the same output name must not share a
+    // `.part`, or one job's cleanup would delete the other's in-flight bytes.
+    let temp_path = output_dir.join(format!("{name}.{task_id}.mp4.part"));
     let mut command = Command::new(ffmpeg);
     command.args([
         "-hide_banner",
@@ -389,7 +391,8 @@ async fn mux_streams_inner(
         }
     };
     let final_path = output_dir.join(format!("{name}.{container}"));
-    let temp_path = output_dir.join(format!("{name}.{container}.part"));
+    // Per-task temp name; see `download_stream_inner`.
+    let temp_path = output_dir.join(format!("{name}.{task_id}.{container}.part"));
     // googlevideo rejects the CDN URLs with 403 unless the request repeats the
     // User-Agent the extractor used, so `-headers` must precede each `-i`: in
     // ffmpeg it is a per-input option, not a global one.

@@ -1,6 +1,6 @@
 //! Mux tests: real ffmpeg, real HTTP, no network.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::queue::TaskSignal;
 
@@ -133,7 +133,7 @@ async fn writes_a_real_mp4_through_the_part_file() {
     assert_eq!(&bytes[4..8], b"ftyp", "output is not an MP4");
     assert!(result.output_path.ends_with(".mp4"));
     assert!(
-        !PathBuf::from(format!("{}.part", result.output_path)).exists(),
+        !out.join("merged.task-mp4.mp4.part").exists(),
         "temp file outlived the mux"
     );
     let _ = tokio::fs::remove_dir_all(out).await;
@@ -221,7 +221,7 @@ async fn cancel_kills_ffmpeg_and_removes_the_part_file() {
     let base = stall().await;
     let out = std::env::temp_dir().join(format!("autofox-mux-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&out).await.expect("mkdir");
-    let part = out.join("merged.mp4.part");
+    let part = out.join("merged.task-cancel.mp4.part");
     tokio::fs::write(&part, b"stale").await.expect("seed part");
 
     let cancel = Arc::new(TaskSignal::default());
@@ -268,8 +268,14 @@ async fn failed_mux_removes_the_part_file() {
     let base = serve(b"not media".to_vec(), 8).await;
     let out = std::env::temp_dir().join(format!("autofox-mux-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&out).await.expect("mkdir");
-    let part = out.join("merged.mp4.part");
+    let part = out.join("merged.task-fail.mp4.part");
     tokio::fs::write(&part, b"stale").await.expect("seed part");
+    // Another task writing the same output name owns its own `.part`; this
+    // task's cleanup must not touch it.
+    let neighbour = out.join("merged.other-task.mp4.part");
+    tokio::fs::write(&neighbour, b"in flight")
+        .await
+        .expect("seed neighbour");
     let error = mux_streams_inner(
         None,
         "task-fail",
@@ -289,6 +295,7 @@ async fn failed_mux_removes_the_part_file() {
     .expect_err("garbage input must fail");
     assert_eq!(error.code, crate::ipc::ErrorCode::MuxFailed);
     assert!(!part.exists(), "failed mux left its .part behind");
+    assert!(neighbour.exists(), "cleanup deleted another task's .part");
     let _ = tokio::fs::remove_dir_all(out).await;
 }
 
