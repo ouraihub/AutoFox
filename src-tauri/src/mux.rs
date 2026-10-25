@@ -183,8 +183,9 @@ async fn download_stream_inner(
         }
     })
     .await
-    .inspect_err(|error| discard_partial(error, &temp_path))?;
+    .inspect_err(|_| discard_partial(&temp_path))?;
     if !output.status.success() {
+        discard_partial(&temp_path);
         return Err(IpcError {
             code: ErrorCode::MuxFailed,
             message_key: "errors.muxFailed",
@@ -195,7 +196,8 @@ async fn download_stream_inner(
     }
     fs::rename(&temp_path, &final_path)
         .await
-        .map_err(|error| io_error(error.to_string()))?;
+        .map_err(|error| io_error(error.to_string()))
+        .inspect_err(|_| discard_partial(&temp_path))?;
     Ok(MuxResult {
         output_path: final_path.to_string_lossy().into_owned(),
     })
@@ -295,15 +297,14 @@ async fn run_with_progress(
         }
     };
     let pumped = tokio::select! {
-        result = timeout(MUX_TIMEOUT, pump) => result.map_err(|_| timed_out())?,
+        result = timeout(MUX_TIMEOUT, pump) => result.unwrap_or_else(|_| Err(timed_out())),
         () = watch => Err(cancelled()),
     };
     if let Err(error) = pumped {
-        // ffmpeg ignores a closed stdout, so the process must be killed
-        // explicitly or it keeps writing the `.part` file to completion.
-        if error.code == ErrorCode::Cancelled {
-            let _ = child.kill().await;
-        }
+        // ffmpeg ignores a closed stdout, so it must be killed on every early
+        // exit. Awaiting the kill also reaps it, which releases the Windows
+        // file lock before the caller deletes the `.part`.
+        let _ = child.kill().await;
         return Err(error);
     }
     let status = timeout(MUX_TIMEOUT, child.wait())
@@ -422,8 +423,9 @@ async fn mux_streams_inner(
         .stderr(Stdio::piped());
     let output = run_with_progress(command, "mux", request.duration_secs, cancel, sink)
         .await
-        .inspect_err(|error| discard_partial(error, &temp_path))?;
+        .inspect_err(|_| discard_partial(&temp_path))?;
     if !output.status.success() {
+        discard_partial(&temp_path);
         // ffmpeg's own diagnosis is the only way to tell a dead CDN URL from a
         // codec the container rejects, and it never contains the signed query.
         logs::error(
@@ -447,7 +449,8 @@ async fn mux_streams_inner(
     }
     fs::rename(&temp_path, &final_path)
         .await
-        .map_err(|error| io_error(error.to_string()))?;
+        .map_err(|error| io_error(error.to_string()))
+        .inspect_err(|_| discard_partial(&temp_path))?;
     if let Some(app) = app {
         let _ = tauri::Emitter::emit(
             app,
@@ -534,18 +537,13 @@ fn io_error(detail: String) -> IpcError {
     }
 }
 
-/// Removes the `.part` file left behind by a killed ffmpeg.
+/// Removes the `.part` file a failed or cancelled ffmpeg left behind.
 ///
 /// A `-c copy` output cut mid-write has no trailing index, so it is neither
-/// playable nor resumable: keeping it would only strand bytes on disk. Only
-/// cancellation is cleaned up -- a failure's partial output is evidence, and
-/// `-y` overwrites it on the next attempt anyway.
-fn discard_partial(error: &IpcError, temp_path: &Path) {
-    if error.code != ErrorCode::Cancelled {
-        return;
-    }
+/// playable nor resumable, and nothing reads it after the task ends.
+fn discard_partial(temp_path: &Path) {
     match std::fs::remove_file(temp_path) {
-        Ok(()) => logs::info(TARGET, "discarded incomplete output after cancel"),
+        Ok(()) => logs::info(TARGET, "discarded incomplete output"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => logs::warn(TARGET, format!("cannot remove incomplete output: {error}")),
     }

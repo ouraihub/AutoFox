@@ -253,6 +253,36 @@ async fn cancel_kills_ffmpeg_and_removes_the_part_file() {
     let _ = tokio::fs::remove_dir_all(out).await;
 }
 
+/// A real ffmpeg failure (input that is not media) must not strand the
+/// seeded `.part` either: only success may leave bytes on disk.
+#[tokio::test]
+async fn failed_mux_removes_the_part_file() {
+    let base = serve(b"not media".to_vec(), 8).await;
+    let out = std::env::temp_dir().join(format!("autofox-mux-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&out).await.expect("mkdir");
+    let part = out.join("merged.mp4.part");
+    tokio::fs::write(&part, b"stale").await.expect("seed part");
+    let error = mux_streams_inner(
+        None,
+        MuxRequest {
+            video_url: format!("{base}/v.mp4"),
+            audio_url: format!("{base}/a.mp4"),
+            output_directory: out.to_string_lossy().into_owned(),
+            file_name: "merged".to_owned(),
+            container: "mp4".to_owned(),
+            http_headers: Default::default(),
+            duration_secs: None,
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .await
+    .expect_err("garbage input must fail");
+    assert_eq!(error.code, crate::ipc::ErrorCode::MuxFailed);
+    assert!(!part.exists(), "failed mux left its .part behind");
+    let _ = tokio::fs::remove_dir_all(out).await;
+}
+
 #[test]
 fn renders_headers_as_a_crlf_block() {
     let headers = BTreeMap::from([
