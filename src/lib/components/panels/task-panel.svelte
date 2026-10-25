@@ -11,6 +11,9 @@
   const { tasks, onRefresh, onCancel }: Props = $props();
 </script>
 
+<!-- `.panel-heading`, `.rows`, `.row` are global primitives in `src/app.css`
+     (shared by every panel, so no single component's scoped <style> owns them). -->
+
 <div class="panel-heading">
   <h2>任务</h2>
   <Button variant="outline" onclick={onRefresh}>刷新</Button>

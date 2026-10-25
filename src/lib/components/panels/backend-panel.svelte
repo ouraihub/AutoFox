@@ -40,6 +40,7 @@
 </div>
 
 <style>
+  /* `.panel-heading`, `.rows`, `.row`, `.named` are global in `src/app.css`. */
   /* Status is never colour-only: the badge text says 就绪 or 未检测 next to the
      dot, so the state survives a monochrome display. */
   .backend-dot { width: .45rem; height: .45rem; border-radius: 50%; background: var(--muted-foreground); }

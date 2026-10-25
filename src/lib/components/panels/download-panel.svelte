@@ -87,6 +87,8 @@
 {/if}
 
 <style>
+  /* Layout primitives (`.panel-heading`, `.rows`, `.row`, `.row-meta`, `.size`,
+     `.meta`) are global in `src/app.css`; only this panel's own parts live here. */
   .advanced { margin-top: var(--space-md); border-top: 1px solid var(--border); }
   .advanced summary { padding: .7rem 0; color: var(--muted-foreground); cursor: pointer; font-size: .72rem; }
   .advanced summary:hover { color: var(--foreground); }
