@@ -9,7 +9,7 @@ use std::{
     fs,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 
@@ -53,7 +53,46 @@ pub struct TaskSummary {
 
 struct TaskRecord {
     summary: TaskSummary,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<TaskSignal>,
+}
+
+/// Run/stop/publish arbitration shared by a task's worker and the registry.
+///
+/// One atomic makes "the user stopped it" and "the worker is publishing its
+/// output" mutually exclusive: whichever transition lands first wins and the
+/// other side sees it. A plain cancel flag left a window between the worker's
+/// last check and its rename in which both happened, publishing a file for a
+/// task the registry reported as cancelled.
+#[derive(Debug, Default)]
+pub struct TaskSignal(AtomicU8);
+
+const RUNNING: u8 = 0;
+const STOPPED: u8 = 1;
+const PUBLISHING: u8 = 2;
+
+impl TaskSignal {
+    /// Whether the user cancelled or paused the task.
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STOPPED
+    }
+
+    /// Requests a stop. Returns `false` once the worker has begun publishing.
+    pub fn stop(&self) -> bool {
+        self.0
+            .compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire)
+            .map_or_else(|current| current == STOPPED, |_| true)
+    }
+
+    /// Claims the right to publish the output. Returns `false` if a stop won.
+    pub fn claim_publish(&self) -> bool {
+        self.0
+            .compare_exchange(RUNNING, PUBLISHING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn resume(&self) {
+        self.0.store(RUNNING, Ordering::Release);
+    }
 }
 
 /// Downloads allowed to run at once. The queue reports `Busy` beyond it.
@@ -136,7 +175,7 @@ impl TaskRegistry {
                 summary.task_id.clone(),
                 TaskRecord {
                     summary,
-                    cancel: Arc::new(AtomicBool::new(false)),
+                    cancel: Arc::new(TaskSignal::default()),
                 },
             );
         }
@@ -156,7 +195,7 @@ impl TaskRegistry {
         &self,
         kind: &str,
         app: Option<&tauri::AppHandle<R>>,
-    ) -> Result<(String, Arc<AtomicBool>), IpcError> {
+    ) -> Result<(String, Arc<TaskSignal>), IpcError> {
         let started = self.register(kind)?;
         if let Some(app) = app {
             self.persist(app);
@@ -168,9 +207,9 @@ impl TaskRegistry {
     ///
     /// Holds the registry lock for its whole body and touches no other state,
     /// so it cannot reach a second `lock` call.
-    fn register(&self, kind: &str) -> Result<(String, Arc<AtomicBool>), IpcError> {
+    fn register(&self, kind: &str) -> Result<(String, Arc<TaskSignal>), IpcError> {
         let task_id = Uuid::new_v4().to_string();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(TaskSignal::default());
         let mut records = self
             .records
             .lock()
@@ -221,7 +260,7 @@ impl TaskRegistry {
         };
         records
             .get(task_id)
-            .is_none_or(|record| record.cancel.load(Ordering::Relaxed))
+            .is_none_or(|record| record.cancel.is_stopped())
     }
 
     /// Marks a task terminal, but never overwrites a state the user chose.
@@ -264,7 +303,17 @@ impl TaskRegistry {
             .lock()
             .map_err(|_| internal("task registry lock poisoned"))?;
         let record = records.get_mut(task_id).ok_or_else(not_found)?;
-        record.cancel.store(true, Ordering::Relaxed);
+        // The worker already claimed publication: the file is being renamed
+        // into place and the task is about to be `Done`, so a stop is too late.
+        if !record.cancel.stop() {
+            return Err(IpcError {
+                code: ErrorCode::Busy,
+                message_key: "errors.taskFinishing",
+                field: None,
+                retryable: false,
+                detail: "task is already saving its output".to_owned(),
+            });
+        }
         record.summary.state = if paused {
             TaskState::Paused
         } else {
@@ -311,7 +360,7 @@ impl TaskRegistry {
                 detail: "task is not paused".to_owned(),
             });
         }
-        record.cancel.store(false, Ordering::Relaxed);
+        record.cancel.resume();
         record.summary.state = TaskState::Downloading;
         Ok(())
     }

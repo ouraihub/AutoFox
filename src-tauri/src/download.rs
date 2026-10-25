@@ -2,12 +2,11 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Instant,
 };
+
+use crate::queue::TaskSignal;
 
 use crate::system::http::ensure_crypto_provider;
 use reqwest::{
@@ -130,16 +129,16 @@ async fn download_direct_inner(
     request: DownloadRequest,
 ) -> Result<DownloadResult, IpcError> {
     let task_id = uuid::Uuid::new_v4().to_string();
-    download_direct_task(app, request, task_id, Arc::new(AtomicBool::new(false))).await
+    download_direct_task(app, request, task_id, Arc::new(TaskSignal::default())).await
 }
 
 async fn download_direct_task(
     app: Option<&tauri::AppHandle>,
     request: DownloadRequest,
     task_id: String,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<TaskSignal>,
 ) -> Result<DownloadResult, IpcError> {
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.is_stopped() {
         return Err(IpcError {
             code: ErrorCode::Cancelled,
             message_key: "errors.cancelled",
@@ -218,7 +217,7 @@ async fn download_direct_task(
     let mut bytes_written = if append { existing } else { 0 };
     let started = Instant::now();
     while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_stopped() {
             return Err(IpcError {
                 code: ErrorCode::Cancelled,
                 message_key: "errors.cancelled",
@@ -250,6 +249,17 @@ async fn download_direct_task(
         .await
         .map_err(|error| io_error("could not flush partial file", error))?;
     drop(file);
+    // Same arbitration as the muxer: a stop that wins keeps the `.part` for a
+    // later resume; a stop that loses is rejected by the registry.
+    if !cancel.claim_publish() {
+        return Err(IpcError {
+            code: ErrorCode::Cancelled,
+            message_key: "errors.cancelled",
+            field: None,
+            retryable: false,
+            detail: "download cancelled".to_owned(),
+        });
+    }
     fs::rename(&part_path, &final_path)
         .await
         .map_err(|error| io_error("could not finalize downloaded file", error))?;

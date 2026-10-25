@@ -7,8 +7,9 @@ mod mux_tests;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicBool, Ordering},
 };
+
+use crate::queue::TaskSignal;
 
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -129,7 +130,7 @@ async fn download_stream_inner(
     app: Option<&tauri::AppHandle>,
     task_id: &str,
     request: StreamRequest,
-    cancel: &AtomicBool,
+    cancel: &TaskSignal,
 ) -> Result<MuxResult, IpcError> {
     let input = validate_http_url(&request.url, "url")?;
     let duration_secs = request.duration_secs;
@@ -195,10 +196,7 @@ async fn download_stream_inner(
             detail: "ffmpeg could not download the stream".to_owned(),
         });
     }
-    fs::rename(&temp_path, &final_path)
-        .await
-        .map_err(|error| io_error(error.to_string()))
-        .inspect_err(|_| discard_partial(&temp_path))?;
+    publish(cancel, &temp_path, &final_path).await?;
     Ok(MuxResult {
         output_path: final_path.to_string_lossy().into_owned(),
     })
@@ -221,7 +219,7 @@ async fn run_with_progress(
     mut command: Command,
     task_id: &str,
     duration_secs: Option<f64>,
-    cancel: &AtomicBool,
+    cancel: &TaskSignal,
     mut sink: impl FnMut(crate::download::DownloadProgress),
 ) -> Result<std::process::Output, IpcError> {
     // Every early return below (timeout, pipe error, cancel) drops `child`;
@@ -294,7 +292,7 @@ async fn run_with_progress(
     // 30-minute timeout. Polling in parallel bounds the reaction to 200ms, and
     // the watch races the whole run, including `wait` after the pipes close.
     let watch = async {
-        while !cancel.load(Ordering::Relaxed) {
+        while !cancel.is_stopped() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     };
@@ -309,15 +307,6 @@ async fn run_with_progress(
         result = timeout(MUX_TIMEOUT, run) => result.unwrap_or_else(|_| Err(timed_out())),
         () = watch => Err(cancelled()),
     };
-    // A cancel that lands between exit and this check would otherwise let the
-    // caller rename the output while the registry already says `Cancelled`.
-    let finished = finished.and_then(|status| {
-        if cancel.load(Ordering::Relaxed) {
-            Err(cancelled())
-        } else {
-            Ok(status)
-        }
-    });
     let status = match finished {
         Ok(status) => status,
         Err(error) => {
@@ -364,7 +353,7 @@ async fn mux_streams_inner(
     app: Option<&tauri::AppHandle>,
     task_id: &str,
     request: MuxRequest,
-    cancel: &AtomicBool,
+    cancel: &TaskSignal,
     sink: impl FnMut(crate::download::DownloadProgress),
 ) -> Result<MuxResult, IpcError> {
     let video = validate_http_url(&request.video_url, "videoUrl")?;
@@ -465,10 +454,7 @@ async fn mux_streams_inner(
             detail: "ffmpeg could not combine the selected streams".to_owned(),
         });
     }
-    fs::rename(&temp_path, &final_path)
-        .await
-        .map_err(|error| io_error(error.to_string()))
-        .inspect_err(|_| discard_partial(&temp_path))?;
+    publish(cancel, &temp_path, &final_path).await?;
     if let Some(app) = app {
         let _ = tauri::Emitter::emit(
             app,
@@ -553,6 +539,23 @@ fn io_error(detail: String) -> IpcError {
         retryable: true,
         detail,
     }
+}
+
+/// Moves the finished `.part` into place, unless the user stopped the task.
+///
+/// `claim_publish` and the registry's `stop` are one atomic transition, so a
+/// cancel either lands first (the output is discarded, never published) or is
+/// rejected because the rename has already been claimed. Checking the flag
+/// and then renaming would leave a window where both happen.
+async fn publish(cancel: &TaskSignal, temp_path: &Path, final_path: &Path) -> Result<(), IpcError> {
+    if !cancel.claim_publish() {
+        discard_partial(temp_path);
+        return Err(cancelled());
+    }
+    fs::rename(temp_path, final_path)
+        .await
+        .map_err(|error| io_error(error.to_string()))
+        .inspect_err(|_| discard_partial(temp_path))
 }
 
 /// Removes the `.part` file a failed or cancelled ffmpeg left behind.

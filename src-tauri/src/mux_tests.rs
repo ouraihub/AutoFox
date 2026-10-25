@@ -1,13 +1,10 @@
 //! Mux tests: real ffmpeg, real HTTP, no network.
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+
+use crate::queue::TaskSignal;
+
+use super::publish;
 
 use tokio::net::TcpListener;
 
@@ -119,7 +116,7 @@ async fn writes_a_real_mp4_through_the_part_file() {
             http_headers: Default::default(),
             duration_secs: None,
         },
-        &AtomicBool::new(false),
+        &TaskSignal::default(),
         |event| event_ids.push(event.task_id),
     )
     .await
@@ -163,7 +160,7 @@ async fn writes_a_real_webm_when_the_option_asks_for_one() {
             http_headers: Default::default(),
             duration_secs: None,
         },
-        &AtomicBool::new(false),
+        &TaskSignal::default(),
         |_| {},
     )
     .await
@@ -193,7 +190,7 @@ async fn rejects_a_container_it_cannot_mux() {
             http_headers: Default::default(),
             duration_secs: None,
         },
-        &AtomicBool::new(false),
+        &TaskSignal::default(),
         |_| {},
     )
     .await
@@ -227,11 +224,11 @@ async fn cancel_kills_ffmpeg_and_removes_the_part_file() {
     let part = out.join("merged.mp4.part");
     tokio::fs::write(&part, b"stale").await.expect("seed part");
 
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(TaskSignal::default());
     let flag = Arc::clone(&cancel);
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        flag.store(true, Ordering::Relaxed);
+        assert!(flag.stop(), "a running mux accepts a stop");
     });
     let started = std::time::Instant::now();
     let error = mux_streams_inner(
@@ -285,7 +282,7 @@ async fn failed_mux_removes_the_part_file() {
             http_headers: Default::default(),
             duration_secs: None,
         },
-        &AtomicBool::new(false),
+        &TaskSignal::default(),
         |_| {},
     )
     .await
@@ -374,7 +371,7 @@ async fn reports_progress_while_ffmpeg_is_still_running() {
         command,
         "mux",
         Some(2.0),
-        &AtomicBool::new(false),
+        &TaskSignal::default(),
         move |event| {
             let at = started.elapsed().as_secs_f64();
             collected
@@ -453,7 +450,7 @@ async fn dropping_the_runner_kills_ffmpeg() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let never = AtomicBool::new(false);
+    let never = TaskSignal::default();
     let run = super::run_with_progress(command, "drop", None, &never, |_| {});
     let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), run).await;
 
@@ -468,4 +465,32 @@ async fn dropping_the_runner_kills_ffmpeg() {
         "ffmpeg kept writing after the runner was dropped"
     );
     let _ = tokio::fs::remove_file(&out).await;
+}
+
+/// The window the arbitration exists for: ffmpeg has exited and the `.part` is
+/// complete, then the stop lands before the rename. Nothing may be published,
+/// and the abandoned `.part` must go.
+#[tokio::test]
+async fn a_stop_after_ffmpeg_exits_prevents_publishing() {
+    let out = std::env::temp_dir().join(format!("autofox-pub-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&out).await.expect("mkdir");
+    let part = out.join("merged.mp4.part");
+    let final_path = out.join("merged.mp4");
+    tokio::fs::write(&part, b"complete output")
+        .await
+        .expect("seed part");
+
+    let signal = TaskSignal::default();
+    assert!(signal.stop(), "running task accepts the stop");
+    let error = publish(&signal, &part, &final_path)
+        .await
+        .expect_err("a stopped task must not publish");
+
+    assert_eq!(error.code, crate::ipc::ErrorCode::Cancelled);
+    assert!(
+        !final_path.exists(),
+        "output was published despite the stop"
+    );
+    assert!(!part.exists(), "abandoned .part was left behind");
+    let _ = tokio::fs::remove_dir_all(out).await;
 }
