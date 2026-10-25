@@ -2,12 +2,18 @@ import { describe, expect, it } from 'vitest';
 
 import {
   parseBackendStatus,
+  parseDownloadResult,
+  parseLogEntries,
   parseManifest,
+  parseMuxResult,
   parseSettings,
   parseTaskProgress,
   parseTaskSummaries,
 } from './contract';
 import { ContractError } from './validate';
+// Written by `ipc_fixture_matches_rust_serialization` in `src-tauri/src/ipc.rs`
+// from the real serde types, so these are the bytes the backend actually sends.
+import fixture from './fixtures/ipc-payloads.json';
 
 /** Minimal payload the Rust side actually emits for a progressive-only video. */
 function manifestPayload() {
@@ -168,5 +174,43 @@ describe('parseBackendStatus', () => {
         ffmpegPath: 'C:/lib/ffmpeg.exe',
       }),
     ).toThrow('backendStatus.ytdlpPath: expected string, got undefined');
+  });
+});
+
+/// The hand-written payloads above prove the parsers' own behaviour; this
+/// proves them against Rust. Every variant serde emits (all options set, all
+/// `None`, empty collections, each tagged enum arm) must parse unchanged.
+describe('Rust-serialized fixture', () => {
+  const cases: [string, unknown[], (value: unknown) => unknown][] = [
+    ['manifest', fixture.manifest, parseManifest],
+    ['backendStatus', fixture.backendStatus, parseBackendStatus],
+    ['settings', fixture.settings, parseSettings],
+    ['tasks', fixture.tasks, parseTaskSummaries],
+    ['progress', fixture.progress, parseTaskProgress],
+    ['downloadResult', fixture.downloadResult, parseDownloadResult],
+    ['muxResult', fixture.muxResult, parseMuxResult],
+    ['logs', fixture.logs, parseLogEntries],
+  ];
+  for (const [name, payloads, parse] of cases) {
+    it.each(payloads.map((payload, index) => [index, payload]))(`parses ${name}[%i]`, (_, payload) => {
+      expect(() => parse(payload)).not.toThrow();
+    });
+  }
+
+  it('reads explicit nulls as absent, which is what serde sends for None', () => {
+    const bare = parseManifest(fixture.manifest[1]);
+    expect(fixture.manifest[1]).toHaveProperty('durationSecs', null);
+    expect(bare.durationSecs).toBeUndefined();
+    expect(bare.entries).toEqual([]);
+  });
+
+  it('keeps every delivery and plan arm the backend can emit', () => {
+    const full = parseManifest(fixture.manifest[0]);
+    expect(full.formats.map((format) => format.delivery.kind)).toEqual(['direct', 'hls', 'dash']);
+    expect(full.downloadOptions.map((option) => option.plan.kind)).toEqual([
+      'progressive',
+      'merge',
+      'manifest',
+    ]);
   });
 });
